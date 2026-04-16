@@ -1,0 +1,18 @@
+{
+  "name": "manychat-grok-webhook",
+  "version": "1.0.0",
+  "description": "ManyChat + Grok xAI webhook server for Instagram DM auto-replies",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev:public": "node dev-public.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "dotenv": "^16.4.0",
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "localtunnel": "^2.0.2"
+  }
+}
