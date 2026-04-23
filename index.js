@@ -90,8 +90,16 @@ async function listConversationIds() {
 }
 
 // ── Pending flush (debounce user message clusters) ───────────────────────────
-const DEBOUNCE_MIN_MS = 30 * 60 * 1000;
-const DEBOUNCE_MAX_MS = 90 * 60 * 1000;
+function readPositiveIntMs(envName, fallback) {
+  const v = parseInt(process.env[envName] || '', 10);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+
+const DEBOUNCE_MIN_MS = readPositiveIntMs('DEBOUNCE_MIN_MS', 30 * 60 * 1000);
+let DEBOUNCE_MAX_MS = readPositiveIntMs('DEBOUNCE_MAX_MS', 90 * 60 * 1000);
+if (DEBOUNCE_MAX_MS < DEBOUNCE_MIN_MS) {
+  DEBOUNCE_MAX_MS = DEBOUNCE_MIN_MS + 60 * 1000;
+}
 const WORKER_POLL_MS = 15 * 1000;
 
 const pendingMemStore = new Map();
