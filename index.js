@@ -93,25 +93,14 @@ async function listConversationIds() {
 async function getHistory(subscriberId, firstName, igUsername) {
   let existing = await loadConversation(subscriberId);
   if (!existing) {
-    let customPrompt;
-
-    // Special persona for Esma (OnlyFans slow flirt character)
-    if (String(subscriberId) === 'f265469u687417251' || String(subscriberId).includes('f265469')) {
-      customPrompt = ESMA_PROMPT;
-      if (firstName || igUsername) {
-        const namePart = [firstName, igUsername ? `(@${igUsername})` : ''].filter(Boolean).join(' ');
-        customPrompt += `\nYou are currently talking to: ${namePart}.`;
-      }
-    } else {
-      // No system prompt — samo povijest poruka za Grok
-      existing = [];
-      await saveConversation(subscriberId, existing);
-      return existing;
+    // Esma persona for every subscriber (this bot is single-purpose).
+    let customPrompt = ESMA_PROMPT;
+    if (firstName || igUsername) {
+      const namePart = [firstName, igUsername ? `(@${igUsername})` : ''].filter(Boolean).join(' ');
+      customPrompt += `\nYou are currently talking to: ${namePart}.`;
     }
 
-    existing = [
-      { role: 'system', content: customPrompt }
-    ];
+    existing = [{ role: 'system', content: customPrompt }];
     await saveConversation(subscriberId, existing);
   }
   return existing;
