@@ -131,8 +131,8 @@ function lastNonSystemRole(messages) {
 function splitReplySmart(reply) {
   const text = String(reply || '').trim();
   if (!text) return [];
-  const maxParts = 3;
-  const maxLen = 200;
+  const maxParts = 4;
+  const maxLen = 135;
 
   const mergeToParts = (chunks) => {
     const trimmed = chunks.map((c) => String(c).trim()).filter(Boolean);
