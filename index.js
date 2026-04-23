@@ -89,6 +89,268 @@ async function listConversationIds() {
   return [...conversations.keys()];
 }
 
+// ── Pending flush (debounce user message clusters) ───────────────────────────
+const DEBOUNCE_MIN_MS = 30 * 60 * 1000;
+const DEBOUNCE_MAX_MS = 90 * 60 * 1000;
+const WORKER_POLL_MS = 15 * 1000;
+
+const pendingMemStore = new Map();
+const memoryFlushLocks = new Set();
+
+const pendingRedisKey = (subscriberId) => `${REDIS_KEY_PREFIX}:pending:${subscriberId}`;
+const pendingIndexKey = `${REDIS_KEY_PREFIX}:pendingIndex`;
+const flushLockRedisKey = (subscriberId) => `${REDIS_KEY_PREFIX}:flushlock:${subscriberId}`;
+
+function randomDebounceMs() {
+  return DEBOUNCE_MIN_MS + Math.random() * (DEBOUNCE_MAX_MS - DEBOUNCE_MIN_MS);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function countUserMessages(messages) {
+  if (!Array.isArray(messages)) return 0;
+  return messages.filter((m) => m.role === 'user').length;
+}
+
+function lastNonSystemRole(messages) {
+  const tail = messages.filter((m) => m.role !== 'system');
+  return tail.length ? tail[tail.length - 1].role : undefined;
+}
+
+/** Split Grok reply into 1–3 short chunks for natural DM sending. */
+function splitReplySmart(reply) {
+  const text = String(reply || '').trim();
+  if (!text) return [];
+  const maxParts = 3;
+  const maxLen = 200;
+
+  const mergeToParts = (chunks) => {
+    const trimmed = chunks.map((c) => String(c).trim()).filter(Boolean);
+    if (!trimmed.length) return [];
+    const out = [];
+    let buf = '';
+    for (const c of trimmed) {
+      if (!buf) buf = c;
+      else if (buf.length + 1 + c.length <= maxLen) buf += `\n${c}`;
+      else {
+        out.push(buf);
+        buf = c;
+      }
+    }
+    if (buf) out.push(buf);
+    while (out.length > maxParts) {
+      out[out.length - 2] = `${out[out.length - 2]}\n${out.pop()}`;
+    }
+    return out.length ? out : [text];
+  };
+
+  if (text.length <= maxLen) return [text];
+
+  const para = text.split(/\n\n+/);
+  if (para.length >= 2) return mergeToParts(para);
+
+  const sentences = text.split(/(?<=[.!?])\s+/);
+  if (sentences.length >= 2) return mergeToParts(sentences);
+
+  const mid = Math.ceil(text.length / 2);
+  return mergeToParts([text.slice(0, mid), text.slice(mid)]);
+}
+
+async function loadPending(subscriberId) {
+  if (redisEnabled) {
+    const raw = await redisClient.get(pendingRedisKey(subscriberId));
+    if (!raw) return undefined;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return pendingMemStore.get(subscriberId);
+}
+
+async function persistPendingStore(subscriberId, payload) {
+  if (redisEnabled) {
+    await redisClient
+      .multi()
+      .set(pendingRedisKey(subscriberId), JSON.stringify(payload))
+      .sAdd(pendingIndexKey, subscriberId)
+      .exec();
+    return;
+  }
+  pendingMemStore.set(subscriberId, payload);
+}
+
+async function schedulePending(subscriberId, meta) {
+  const existing = (await loadPending(subscriberId)) || {};
+  const dueAt = Date.now() + randomDebounceMs();
+  const payload = {
+    ...existing,
+    ...meta,
+    dueAt
+  };
+  await persistPendingStore(subscriberId, payload);
+  return dueAt;
+}
+
+async function clearPending(subscriberId) {
+  if (redisEnabled) {
+    await redisClient.multi().del(pendingRedisKey(subscriberId)).sRem(pendingIndexKey, subscriberId).exec();
+    return;
+  }
+  pendingMemStore.delete(subscriberId);
+}
+
+async function listPendingIds() {
+  if (redisEnabled) {
+    return redisClient.sMembers(pendingIndexKey);
+  }
+  return [...pendingMemStore.keys()];
+}
+
+async function acquireFlushLock(subscriberId) {
+  if (redisEnabled) {
+    const ok = await redisClient.set(flushLockRedisKey(subscriberId), '1', { NX: true, EX: 120 });
+    return ok === 'OK';
+  }
+  if (memoryFlushLocks.has(subscriberId)) return false;
+  memoryFlushLocks.add(subscriberId);
+  return true;
+}
+
+async function releaseFlushLock(subscriberId) {
+  if (redisEnabled) {
+    await redisClient.del(flushLockRedisKey(subscriberId));
+    return;
+  }
+  memoryFlushLocks.delete(subscriberId);
+}
+
+async function flushPending(subscriberId) {
+  if (!GROK_API_KEY) return;
+
+  const pendingRaw = await loadPending(subscriberId);
+  if (!pendingRaw || pendingRaw.dueAt > Date.now()) return;
+
+  const msgsBefore = await loadConversation(subscriberId);
+  if (!Array.isArray(msgsBefore) || msgsBefore.length === 0) {
+    await clearPending(subscriberId);
+    return;
+  }
+  if (lastNonSystemRole(msgsBefore) !== 'user') {
+    await clearPending(subscriberId);
+    return;
+  }
+
+  const userSnap = countUserMessages(msgsBefore);
+
+  const got = await acquireFlushLock(subscriberId);
+  if (!got) return;
+
+  try {
+    const pendingAgain = await loadPending(subscriberId);
+    if (!pendingAgain || pendingAgain.dueAt > Date.now()) return;
+
+    const messagesForGrok = await loadConversation(subscriberId);
+    if (countUserMessages(messagesForGrok) !== userSnap) return;
+
+    const grokResponse = await axios.post(
+      GROK_URL,
+      {
+        model: GROK_MODEL,
+        messages: messagesForGrok,
+        temperature: 0.8
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${GROK_API_KEY}`
+        },
+        timeout: 60000
+      }
+    );
+
+    const reply = grokResponse.data.choices[0].message.content;
+
+    const messagesAfterGrok = await loadConversation(subscriberId);
+    if (countUserMessages(messagesAfterGrok) !== userSnap) {
+      console.warn(`⚠️  [${subscriberId}] Flush aborted after Grok (new user messages).`);
+      return;
+    }
+
+    const parts = splitReplySmart(reply);
+    const chunks = parts.length ? parts : [String(reply)];
+
+    if (UCHAT_API_KEY) {
+      for (let i = 0; i < chunks.length; i++) {
+        const part = chunks[i];
+        await axios.post(
+          UCHAT_URL,
+          { user_ns: subscriberId, content: part },
+          {
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${UCHAT_API_KEY}`
+            },
+            timeout: 15000
+          }
+        );
+        if (i < chunks.length - 1) {
+          await sleep(1500 + Math.random() * 2500);
+        }
+      }
+    } else {
+      console.warn(`⚠️  UCHAT_API_KEY missing; reply not sent for ${subscriberId}`);
+    }
+
+    const fresh = await loadConversation(subscriberId);
+    if (countUserMessages(fresh) !== userSnap) return;
+
+    fresh.push({ role: 'assistant', content: reply });
+    trimHistory(fresh);
+    await saveConversation(subscriberId, fresh);
+
+    await clearPending(subscriberId);
+
+    pushTrigger({
+      id: `${Date.now()}-flush-${Math.random().toString(36).slice(2, 9)}`,
+      at: new Date().toISOString(),
+      outcome: 'flushed',
+      subscriber_id: subscriberId,
+      reply_preview: String(reply).slice(0, 200)
+    });
+
+    console.log(`✅ [${subscriberId}] Flushed cluster (${chunks.length} UChat part(s))`);
+  } catch (err) {
+    const detail = err.response?.data || err.message;
+    console.error(`❌ Flush failed [${subscriberId}]:`, detail);
+  } finally {
+    await releaseFlushLock(subscriberId);
+  }
+}
+
+async function pendingWorkerTick() {
+  try {
+    const ids = await listPendingIds();
+    await Promise.all(ids.map((id) => flushPending(String(id))));
+  } catch (e) {
+    console.error('worker tick error', e.message);
+  }
+}
+
+let pendingWorkerStarted = false;
+function startPendingWorker() {
+  if (pendingWorkerStarted) return;
+  pendingWorkerStarted = true;
+  setInterval(pendingWorkerTick, WORKER_POLL_MS);
+  console.log(
+    `⏳ Pending worker (debounce ${DEBOUNCE_MIN_MS / 60000}-${DEBOUNCE_MAX_MS / 60000} min, poll ${WORKER_POLL_MS / 1000}s)`
+  );
+}
+
 // Get or create conversation history for a subscriber
 async function getHistory(subscriberId, firstName, igUsername) {
   let existing = await loadConversation(subscriberId);
@@ -219,21 +481,23 @@ function redactMessagesForView(messages) {
   );
 }
 
-// ── POST /webhook/make — Make.com HTTP Request handler ───────────────────────
+// ── POST /webhook — UChat / external HTTP (queue + debounced flush) ───────────
 const webhookHandler = async (req, res) => {
   const triggerId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
   try {
     const body = req.body;
-    console.log('📩 Incoming Make.com webhook:', JSON.stringify(body).slice(0, 500));
+    console.log('📩 Incoming webhook:', JSON.stringify(body).slice(0, 500));
 
     const { subscriberId, userText, firstName, igUsername } = extractWebhookFields(body);
 
-    // Vrati grešku Make-u ako fale podaci (Make će to zabilježiti u svojoj povijesti)
+    if (!GROK_API_KEY) {
+      console.error('❌ GROK_API_KEY missing');
+      return res.status(500).json({ status: 'error', reason: 'GROK_API_KEY not configured' });
+    }
+
     if (!subscriberId || !userText) {
-      const reason = !subscriberId
-        ? 'missing_sender_id'
-        : 'missing_text';
-      console.warn('⚠️  Skipping (no Grok):', { reason, subscriberId, userText });
+      const reason = !subscriberId ? 'missing_sender_id' : 'missing_text';
+      console.warn('⚠️  Skipping (queue):', { reason, subscriberId, userText });
       pushTrigger({
         id: triggerId,
         at: new Date().toISOString(),
@@ -253,70 +517,34 @@ const webhookHandler = async (req, res) => {
 
     console.log(`👤 [${subscriberId}] User says: "${userText}"`);
 
-    // ── 1. Build conversation history ────────────────────────────────────
     const messages = await getHistory(subscriberId, firstName, igUsername);
     messages.push({ role: 'user', content: userText });
-
-    // ── 2. Call Grok xAI API ─────────────────────────────────────────────
-    const grokResponse = await axios.post(
-      GROK_URL,
-      {
-        model: GROK_MODEL,
-        messages,
-        temperature: 0.8
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${GROK_API_KEY}`
-        }
-      }
-    );
-
-    const reply = grokResponse.data.choices[0].message.content;
-    console.log(`🤖 [${subscriberId}] Grok says: "${reply}"`);
-
-    // Save assistant reply and trim if needed
-    messages.push({ role: 'assistant', content: reply });
     trimHistory(messages);
     await saveConversation(subscriberId, messages);
 
-    // ── 3. Pošalji odgovor nazad (ili Make.com ili UChat) ───────────────────────
-    
-    if (req.path.includes('uchat') && UCHAT_API_KEY) {
-      // Ako je webhook s UChat.com.au, šaljemo API poziv
-      const ucPayload = {
-        user_ns: subscriberId,
-        content: reply
-      };
-      const ucResponse = await axios.post(UCHAT_URL, ucPayload, {
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${UCHAT_API_KEY}`
-        }
-      });
-      console.log(`✅ [${subscriberId}] UChat send status:`, ucResponse.data);
-    }
+    const dueAt = await schedulePending(subscriberId, {
+      firstName,
+      igUsername,
+      path: req.path
+    });
 
     pushTrigger({
       id: triggerId,
       at: new Date().toISOString(),
-      outcome: 'ok',
+      outcome: 'queued',
       subscriber_id: subscriberId,
       first_name: firstName ?? null,
       ig_username: igUsername ?? null,
       user_text: userText,
-      reply_preview: String(reply).slice(0, 200),
+      scheduled_for: new Date(dueAt).toISOString(),
       raw_json: rawJsonPreview(body)
     });
 
-    // Make.com (ili UChat HTTP Node) će dobiti ovaj JSON 
-    return res.json({ 
-      status: 'ok', 
-      reply: reply,
+    return res.status(202).json({
+      status: 'queued',
+      scheduled_for: new Date(dueAt).toISOString(),
       sender_id: subscriberId
     });
-
   } catch (err) {
     const detail = err.response?.data || err.message;
     console.error('❌ Webhook error:', detail);
@@ -573,6 +801,8 @@ async function startServer() {
   } else {
     console.warn('⚠️  REDIS_URL not set. Using in-memory conversations only.');
   }
+
+  startPendingWorker();
 
   app.listen(PORT, () => {
     console.log(`\n🟢 Webhook server running on http://localhost:${PORT}`);
