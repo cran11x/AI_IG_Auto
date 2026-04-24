@@ -49,6 +49,7 @@ function pushTrigger(entry) {
 }
 
 const { ESMA_PROMPT } = require('./prompts/esma');
+const { withTimeAwareMessages } = require('./prompts/timeContext');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -278,11 +279,13 @@ async function flushPending(subscriberId) {
     const messagesForGrok = await loadConversation(subscriberId);
     if (countUserMessages(messagesForGrok) !== userSnap) return;
 
+    const grokMessages = withTimeAwareMessages(messagesForGrok);
+
     const grokResponse = await axios.post(
       GROK_URL,
       {
         model: GROK_MODEL,
-        messages: messagesForGrok,
+        messages: grokMessages,
         temperature: 0.8
       },
       {

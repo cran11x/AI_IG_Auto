@@ -11,6 +11,7 @@
 require('dotenv').config();
 const axios = require('axios');
 const { variants, listVariants } = require('./prompts/variants');
+const { withTimeAwareMessages } = require('./prompts/timeContext');
 
 const GROK_URL = 'https://api.x.ai/v1/chat/completions';
 const GROK_MODEL = process.env.GROK_MODEL || 'grok-4';
@@ -46,9 +47,10 @@ function buildInitialMessages(systemText, nameLine) {
 }
 
 async function callGrok(messages) {
+  const payloadMessages = withTimeAwareMessages(messages);
   const res = await axios.post(
     GROK_URL,
-    { model: GROK_MODEL, messages, temperature: 0.85 },
+    { model: GROK_MODEL, messages: payloadMessages, temperature: 0.85 },
     {
       headers: {
         'Content-Type': 'application/json',
