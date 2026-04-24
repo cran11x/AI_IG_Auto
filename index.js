@@ -148,6 +148,19 @@ function splitReplySmart(reply) {
       }
     }
     if (buf) out.push(buf);
+
+    // Blaga randomizacija: u ~30% slučajeva spoji zadnje dvije poruke ako nisu preduge, da varira broj poruka
+    if (out.length > 1 && Math.random() < 0.3) {
+      const last1 = out.pop();
+      const last2 = out.pop();
+      if (last1 && last2 && (last1.length + last2.length) < 160) {
+        out.push(`${last2}\n${last1}`);
+      } else {
+        if (last2) out.push(last2);
+        if (last1) out.push(last1);
+      }
+    }
+
     while (out.length > maxParts) {
       out[out.length - 2] = `${out[out.length - 2]}\n${out.pop()}`;
     }
