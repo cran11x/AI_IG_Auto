@@ -11,22 +11,20 @@
 const { ESMA_PROMPT } = require('./esma');
 const { SARA_PROMPT } = require('./sara');
 
-const GLOBAL_UCHAT_KEY = process.env.UCHAT_API_KEY;
-
 const BOTS = {
   esma: {
     id: 'esma',
     displayName: 'Esma',
     prompt: ESMA_PROMPT,
     timezone: process.env.ESMA_TIMEZONE || 'Europe/London',
-    uchatApiKey: process.env.UCHAT_ESMA_API_KEY || GLOBAL_UCHAT_KEY
+    uchatApiKey: process.env.UCHAT_ESMA_API_KEY
   },
   sara: {
     id: 'sara',
     displayName: 'Sara',
     prompt: SARA_PROMPT,
     timezone: process.env.SARA_TIMEZONE || 'America/New_York',
-    uchatApiKey: process.env.UCHAT_SARA_API_KEY || GLOBAL_UCHAT_KEY
+    uchatApiKey: process.env.UCHAT_SARA_API_KEY
   }
 };
 
