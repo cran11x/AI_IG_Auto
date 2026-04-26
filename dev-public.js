@@ -38,20 +38,28 @@ function waitForServerReady(timeoutMs = 60000) {
   });
 }
 
-function printUchatSteps(webhookUrl) {
-  console.log('\n--- UChat Setup ---');
-  console.log('1. Odaberi "External Request" (HTTP Request) blok');
-  console.log('2. Request URL: ' + webhookUrl);
-  console.log('3. Method: POST');
-  console.log('4. Headers: Content-Type: application/json');
-  console.log('5. Body: odaberi Raw / JSON i upiši:');
+let BOT_IDS = ['esma', 'sara'];
+try {
+  const { listBotIds } = require('./prompts/bots');
+  BOT_IDS = listBotIds();
+} catch {
+  /* fallback ostaje gore */
+}
+
+function printUchatSteps(baseUrl) {
+  console.log('\n--- UChat Setup (per bot) ---');
+  console.log('Body je isti za sve botove (ubaci varijable klikom na UChat izbornik):');
   console.log('   {');
   console.log('     "user_ns": "{{user_ns}}",');
   console.log('     "text": "{{last_input_text}}",');
   console.log('     "name": "{{first_name}}",');
   console.log('     "username": "{{instagram_username}}"');
   console.log('   }');
-  console.log('   (Važno: ubaci varijable klikom na izbornik)');
+  console.log('Method: POST   Headers: Content-Type: application/json\n');
+  for (const id of BOT_IDS) {
+    console.log(`  ${id.toUpperCase()}  →  ${baseUrl}/webhook/uchat/${id}`);
+  }
+  console.log('\nLegacy alias (zadani bot): ' + baseUrl + '/webhook/uchat');
   console.log('---\n');
 }
 
@@ -105,11 +113,13 @@ async function main() {
     if (!base) return;
     printed.done = true;
     console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('Public webhook URL (UChat External Request):');
-    console.log(`${base}/webhook/uchat`);
+    console.log('Public webhook URLs (UChat External Request):');
+    for (const id of BOT_IDS) {
+      console.log(`  ${id}: ${base}/webhook/uchat/${id}`);
+    }
     console.log('Health check:', `${base}/`);
     console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    printUchatSteps(`${base}/webhook/uchat`);
+    printUchatSteps(base);
   };
 
   if (TUNNEL_MODE === 'pinggy') {

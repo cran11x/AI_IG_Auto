@@ -13,7 +13,6 @@ const GROK_API_KEY = process.env.GROK_API_KEY;
 const GROK_URL = 'https://api.x.ai/v1/chat/completions';
 const GROK_MODEL = process.env.GROK_MODEL || 'grok-4';
 
-const UCHAT_API_KEY = process.env.UCHAT_API_KEY;
 const UCHAT_URL = 'https://www.uchat.com.au/api/subscriber/send-text';
 const REDIS_URL = process.env.REDIS_URL;
 const REDIS_KEY_PREFIX = process.env.REDIS_KEY_PREFIX || 'autodms';
@@ -22,15 +21,20 @@ const REQUIRE_REDIS = String(process.env.REQUIRE_REDIS || '').toLowerCase() === 
 /** If set, GET /messages* requires ?token=... or X-View-Token header (use when tunneling). */
 const VIEW_MESSAGES_TOKEN = process.env.VIEW_MESSAGES_TOKEN;
 
-// Max user+assistant turns kept (for Esma, one optional system message is kept at index 0)
+// Max user+assistant turns kept (one optional system message is kept at index 0)
 const MAX_HISTORY = 20;
 
+// ── Bot config (Esma, Sara, …) ──────────────────────────────────────────────
+const { BOTS, DEFAULT_BOT_ID, getBot, listBotIds } = require('./prompts/bots');
+const { withTimeAwareMessages } = require('./prompts/timeContext');
+
 // ── Conversation store (Redis primary; in-memory fallback) ───────────────────
+// In-memory maps su keyani po `${botId}:${subscriberId}` da Esma i Sara nemaju zajedničku istoriju.
 const conversations = new Map();
 const redisClient = REDIS_URL ? createClient({ url: REDIS_URL }) : null;
 let redisEnabled = false;
 
-/** Svaki POST /webhook (zadnjih MAX_TRIGGER_LOG) — da vidiš što ManyChat triggera šalje. */
+/** Svaki POST /webhook (zadnjih MAX_TRIGGER_LOG) — da vidiš što UChat triggera šalje. */
 const MAX_TRIGGER_LOG = 100;
 const triggerLog = [];
 
@@ -48,18 +52,17 @@ function pushTrigger(entry) {
   if (triggerLog.length > MAX_TRIGGER_LOG) triggerLog.length = MAX_TRIGGER_LOG;
 }
 
-const { ESMA_PROMPT } = require('./prompts/esma');
-const { withTimeAwareMessages } = require('./prompts/timeContext');
-
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-const conversationKey = (subscriberId) =>
-  `${REDIS_KEY_PREFIX}:conversation:${subscriberId}`;
-const conversationIndexKey = `${REDIS_KEY_PREFIX}:conversations`;
+const memKey = (botId, subscriberId) => `${botId}:${subscriberId}`;
 
-async function loadConversation(subscriberId) {
+const conversationKey = (botId, subscriberId) =>
+  `${REDIS_KEY_PREFIX}:${botId}:conversation:${subscriberId}`;
+const conversationIndexKey = (botId) => `${REDIS_KEY_PREFIX}:${botId}:conversations`;
+
+async function loadConversation(botId, subscriberId) {
   if (redisEnabled) {
-    const raw = await redisClient.get(conversationKey(subscriberId));
+    const raw = await redisClient.get(conversationKey(botId, subscriberId));
     if (!raw) return undefined;
     try {
       const parsed = JSON.parse(raw);
@@ -68,26 +71,29 @@ async function loadConversation(subscriberId) {
       return undefined;
     }
   }
-  return conversations.get(subscriberId);
+  return conversations.get(memKey(botId, subscriberId));
 }
 
-async function saveConversation(subscriberId, messages) {
+async function saveConversation(botId, subscriberId, messages) {
   if (redisEnabled) {
     await redisClient
       .multi()
-      .set(conversationKey(subscriberId), JSON.stringify(messages))
-      .sAdd(conversationIndexKey, subscriberId)
+      .set(conversationKey(botId, subscriberId), JSON.stringify(messages))
+      .sAdd(conversationIndexKey(botId), subscriberId)
       .exec();
     return;
   }
-  conversations.set(subscriberId, messages);
+  conversations.set(memKey(botId, subscriberId), messages);
 }
 
-async function listConversationIds() {
+async function listConversationIds(botId) {
   if (redisEnabled) {
-    return redisClient.sMembers(conversationIndexKey);
+    return redisClient.sMembers(conversationIndexKey(botId));
   }
-  return [...conversations.keys()];
+  const prefix = `${botId}:`;
+  return [...conversations.keys()]
+    .filter((k) => k.startsWith(prefix))
+    .map((k) => k.slice(prefix.length));
 }
 
 // ── Pending flush (debounce user message clusters) ───────────────────────────
@@ -106,9 +112,11 @@ const WORKER_POLL_MS = 15 * 1000;
 const pendingMemStore = new Map();
 const memoryFlushLocks = new Set();
 
-const pendingRedisKey = (subscriberId) => `${REDIS_KEY_PREFIX}:pending:${subscriberId}`;
-const pendingIndexKey = `${REDIS_KEY_PREFIX}:pendingIndex`;
-const flushLockRedisKey = (subscriberId) => `${REDIS_KEY_PREFIX}:flushlock:${subscriberId}`;
+const pendingRedisKey = (botId, subscriberId) =>
+  `${REDIS_KEY_PREFIX}:${botId}:pending:${subscriberId}`;
+const pendingIndexKey = (botId) => `${REDIS_KEY_PREFIX}:${botId}:pendingIndex`;
+const flushLockRedisKey = (botId, subscriberId) =>
+  `${REDIS_KEY_PREFIX}:${botId}:flushlock:${subscriberId}`;
 
 function randomDebounceMs() {
   return DEBOUNCE_MIN_MS + Math.random() * (DEBOUNCE_MAX_MS - DEBOUNCE_MIN_MS);
@@ -180,9 +188,9 @@ function splitReplySmart(reply) {
   return mergeToParts([text.slice(0, mid), text.slice(mid)]);
 }
 
-async function loadPending(subscriberId) {
+async function loadPending(botId, subscriberId) {
   if (redisEnabled) {
-    const raw = await redisClient.get(pendingRedisKey(subscriberId));
+    const raw = await redisClient.get(pendingRedisKey(botId, subscriberId));
     if (!raw) return undefined;
     try {
       const parsed = JSON.parse(raw);
@@ -191,95 +199,106 @@ async function loadPending(subscriberId) {
       return undefined;
     }
   }
-  return pendingMemStore.get(subscriberId);
+  return pendingMemStore.get(memKey(botId, subscriberId));
 }
 
-async function persistPendingStore(subscriberId, payload) {
+async function persistPendingStore(botId, subscriberId, payload) {
   if (redisEnabled) {
     await redisClient
       .multi()
-      .set(pendingRedisKey(subscriberId), JSON.stringify(payload))
-      .sAdd(pendingIndexKey, subscriberId)
+      .set(pendingRedisKey(botId, subscriberId), JSON.stringify(payload))
+      .sAdd(pendingIndexKey(botId), subscriberId)
       .exec();
     return;
   }
-  pendingMemStore.set(subscriberId, payload);
+  pendingMemStore.set(memKey(botId, subscriberId), payload);
 }
 
-async function schedulePending(subscriberId, meta) {
-  const existing = (await loadPending(subscriberId)) || {};
+async function schedulePending(botId, subscriberId, meta) {
+  const existing = (await loadPending(botId, subscriberId)) || {};
   const dueAt = Date.now() + randomDebounceMs();
   const payload = {
     ...existing,
     ...meta,
+    botId,
     dueAt
   };
-  await persistPendingStore(subscriberId, payload);
+  await persistPendingStore(botId, subscriberId, payload);
   return dueAt;
 }
 
-async function clearPending(subscriberId) {
+async function clearPending(botId, subscriberId) {
   if (redisEnabled) {
-    await redisClient.multi().del(pendingRedisKey(subscriberId)).sRem(pendingIndexKey, subscriberId).exec();
+    await redisClient
+      .multi()
+      .del(pendingRedisKey(botId, subscriberId))
+      .sRem(pendingIndexKey(botId), subscriberId)
+      .exec();
     return;
   }
-  pendingMemStore.delete(subscriberId);
+  pendingMemStore.delete(memKey(botId, subscriberId));
 }
 
-async function listPendingIds() {
+async function listPendingIds(botId) {
   if (redisEnabled) {
-    return redisClient.sMembers(pendingIndexKey);
+    return redisClient.sMembers(pendingIndexKey(botId));
   }
-  return [...pendingMemStore.keys()];
+  const prefix = `${botId}:`;
+  return [...pendingMemStore.keys()]
+    .filter((k) => k.startsWith(prefix))
+    .map((k) => k.slice(prefix.length));
 }
 
-async function acquireFlushLock(subscriberId) {
+async function acquireFlushLock(botId, subscriberId) {
   if (redisEnabled) {
-    const ok = await redisClient.set(flushLockRedisKey(subscriberId), '1', { NX: true, EX: 120 });
+    const ok = await redisClient.set(flushLockRedisKey(botId, subscriberId), '1', { NX: true, EX: 120 });
     return ok === 'OK';
   }
-  if (memoryFlushLocks.has(subscriberId)) return false;
-  memoryFlushLocks.add(subscriberId);
+  const k = memKey(botId, subscriberId);
+  if (memoryFlushLocks.has(k)) return false;
+  memoryFlushLocks.add(k);
   return true;
 }
 
-async function releaseFlushLock(subscriberId) {
+async function releaseFlushLock(botId, subscriberId) {
   if (redisEnabled) {
-    await redisClient.del(flushLockRedisKey(subscriberId));
+    await redisClient.del(flushLockRedisKey(botId, subscriberId));
     return;
   }
-  memoryFlushLocks.delete(subscriberId);
+  memoryFlushLocks.delete(memKey(botId, subscriberId));
 }
 
-async function flushPending(subscriberId) {
+async function flushPending(botId, subscriberId) {
   if (!GROK_API_KEY) return;
+  const bot = getBot(botId);
+  if (!bot) return;
 
-  const pendingRaw = await loadPending(subscriberId);
+  const pendingRaw = await loadPending(botId, subscriberId);
   if (!pendingRaw || pendingRaw.dueAt > Date.now()) return;
 
-  const msgsBefore = await loadConversation(subscriberId);
+  const msgsBefore = await loadConversation(botId, subscriberId);
   if (!Array.isArray(msgsBefore) || msgsBefore.length === 0) {
-    await clearPending(subscriberId);
+    await clearPending(botId, subscriberId);
     return;
   }
   if (lastNonSystemRole(msgsBefore) !== 'user') {
-    await clearPending(subscriberId);
+    await clearPending(botId, subscriberId);
     return;
   }
 
   const userSnap = countUserMessages(msgsBefore);
 
-  const got = await acquireFlushLock(subscriberId);
+  const got = await acquireFlushLock(botId, subscriberId);
   if (!got) return;
 
   try {
-    const pendingAgain = await loadPending(subscriberId);
+    const pendingAgain = await loadPending(botId, subscriberId);
     if (!pendingAgain || pendingAgain.dueAt > Date.now()) return;
 
-    const messagesForGrok = await loadConversation(subscriberId);
+    const messagesForGrok = await loadConversation(botId, subscriberId);
     if (countUserMessages(messagesForGrok) !== userSnap) return;
 
-    const grokMessages = withTimeAwareMessages(messagesForGrok);
+    const grokMessages = withTimeAwareMessages(messagesForGrok, bot.timezone);
 
     const grokResponse = await axios.post(
       GROK_URL,
@@ -299,16 +318,17 @@ async function flushPending(subscriberId) {
 
     const reply = grokResponse.data.choices[0].message.content;
 
-    const messagesAfterGrok = await loadConversation(subscriberId);
+    const messagesAfterGrok = await loadConversation(botId, subscriberId);
     if (countUserMessages(messagesAfterGrok) !== userSnap) {
-      console.warn(`⚠️  [${subscriberId}] Flush aborted after Grok (new user messages).`);
+      console.warn(`⚠️  [${bot.id}/${subscriberId}] Flush aborted after Grok (new user messages).`);
       return;
     }
 
     const parts = splitReplySmart(reply);
     const chunks = parts.length ? parts : [String(reply)];
 
-    if (UCHAT_API_KEY) {
+    const uchatApiKey = bot.uchatApiKey;
+    if (uchatApiKey) {
       for (let i = 0; i < chunks.length; i++) {
         const part = chunks[i];
         await axios.post(
@@ -317,7 +337,7 @@ async function flushPending(subscriberId) {
           {
             headers: {
               'Content-Type': 'application/json',
-              Authorization: `Bearer ${UCHAT_API_KEY}`
+              Authorization: `Bearer ${uchatApiKey}`
             },
             timeout: 15000
           }
@@ -327,39 +347,42 @@ async function flushPending(subscriberId) {
         }
       }
     } else {
-      console.warn(`⚠️  UCHAT_API_KEY missing; reply not sent for ${subscriberId}`);
+      console.warn(`⚠️  UChat API key missing for bot=${bot.id}; reply not sent for ${subscriberId}`);
     }
 
-    const fresh = await loadConversation(subscriberId);
+    const fresh = await loadConversation(botId, subscriberId);
     if (countUserMessages(fresh) !== userSnap) return;
 
     fresh.push({ role: 'assistant', content: reply });
     trimHistory(fresh);
-    await saveConversation(subscriberId, fresh);
+    await saveConversation(botId, subscriberId, fresh);
 
-    await clearPending(subscriberId);
+    await clearPending(botId, subscriberId);
 
     pushTrigger({
       id: `${Date.now()}-flush-${Math.random().toString(36).slice(2, 9)}`,
       at: new Date().toISOString(),
       outcome: 'flushed',
+      bot: bot.id,
       subscriber_id: subscriberId,
       reply_preview: String(reply).slice(0, 200)
     });
 
-    console.log(`✅ [${subscriberId}] Flushed cluster (${chunks.length} UChat part(s))`);
+    console.log(`✅ [${bot.id}/${subscriberId}] Flushed cluster (${chunks.length} UChat part(s))`);
   } catch (err) {
     const detail = err.response?.data || err.message;
-    console.error(`❌ Flush failed [${subscriberId}]:`, detail);
+    console.error(`❌ Flush failed [${bot.id}/${subscriberId}]:`, detail);
   } finally {
-    await releaseFlushLock(subscriberId);
+    await releaseFlushLock(botId, subscriberId);
   }
 }
 
 async function pendingWorkerTick() {
   try {
-    const ids = await listPendingIds();
-    await Promise.all(ids.map((id) => flushPending(String(id))));
+    for (const botId of listBotIds()) {
+      const ids = await listPendingIds(botId);
+      await Promise.all(ids.map((id) => flushPending(botId, String(id))));
+    }
   } catch (e) {
     console.error('worker tick error', e.message);
   }
@@ -375,24 +398,24 @@ function startPendingWorker() {
   );
 }
 
-// Get or create conversation history for a subscriber
-async function getHistory(subscriberId, firstName, igUsername) {
-  let existing = await loadConversation(subscriberId);
+// Get or create conversation history for a (bot, subscriber) pair
+async function getHistory(botId, subscriberId, firstName, igUsername) {
+  const bot = getBot(botId);
+  let existing = await loadConversation(botId, subscriberId);
   if (!existing) {
-    // Esma persona for every subscriber (this bot is single-purpose).
-    let customPrompt = ESMA_PROMPT;
+    let customPrompt = bot.prompt;
     if (firstName || igUsername) {
       const namePart = [firstName, igUsername ? `(@${igUsername})` : ''].filter(Boolean).join(' ');
       customPrompt += `\nYou are currently talking to: ${namePart}.`;
     }
 
     existing = [{ role: 'system', content: customPrompt }];
-    await saveConversation(subscriberId, existing);
+    await saveConversation(botId, subscriberId, existing);
   }
   return existing;
 }
 
-// Trim history (keep optional system at [0] for Esma; otherwise last MAX_HISTORY user/assistant msgs)
+// Trim history (keep optional system at [0]; otherwise last MAX_HISTORY user/assistant msgs)
 function trimHistory(messages) {
   if (messages.length === 0) return;
   const hasSystem = messages[0].role === 'system';
@@ -407,7 +430,6 @@ function trimHistory(messages) {
 
 // Pull subscriber id + last user text from Make.com or UChat payload shapes
 function extractWebhookFields(body) {
-  // Make.com or UChat "External Request"
   // Očekujemo strukturu npr: { "sender_id": "123", "text": "Bok", "name": "Dani" }
   // Ili za UChat: { "user_ns": "...", "text": "...", "name": "...", "username": "..." }
 
@@ -505,115 +527,158 @@ function redactMessagesForView(messages) {
   );
 }
 
-// ── POST /webhook — UChat / external HTTP (queue + debounced flush) ───────────
-const webhookHandler = async (req, res) => {
-  const triggerId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-  try {
-    const body = req.body;
-    console.log('📩 Incoming webhook:', JSON.stringify(body).slice(0, 500));
+// ── Webhook handler factory (per-bot route → shared logic) ───────────────────
+function makeWebhookHandler(botId) {
+  return async (req, res) => {
+    const triggerId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const bot = getBot(botId);
+    try {
+      const body = req.body;
+      console.log(`📩 [${bot ? bot.id : '?'}] Incoming webhook:`, JSON.stringify(body).slice(0, 500));
 
-    const { subscriberId, userText, firstName, igUsername } = extractWebhookFields(body);
+      if (!bot) {
+        pushTrigger({
+          id: triggerId,
+          at: new Date().toISOString(),
+          outcome: 'skipped',
+          reason: 'unknown_bot',
+          bot: botId,
+          raw_json: rawJsonPreview(body || {})
+        });
+        return res.status(404).json({
+          status: 'error',
+          reason: `Unknown bot id "${botId}". Known: ${listBotIds().join(', ')}`
+        });
+      }
 
-    if (!GROK_API_KEY) {
-      console.error('❌ GROK_API_KEY missing');
-      return res.status(500).json({ status: 'error', reason: 'GROK_API_KEY not configured' });
-    }
+      const { subscriberId, userText, firstName, igUsername } = extractWebhookFields(body);
 
-    if (!subscriberId || !userText) {
-      const reason = !subscriberId ? 'missing_sender_id' : 'missing_text';
-      console.warn('⚠️  Skipping (queue):', { reason, subscriberId, userText });
+      if (!GROK_API_KEY) {
+        console.error('❌ GROK_API_KEY missing');
+        return res.status(500).json({ status: 'error', reason: 'GROK_API_KEY not configured' });
+      }
+
+      if (!subscriberId || !userText) {
+        const reason = !subscriberId ? 'missing_sender_id' : 'missing_text';
+        console.warn('⚠️  Skipping (queue):', { bot: bot.id, reason, subscriberId, userText });
+        pushTrigger({
+          id: triggerId,
+          at: new Date().toISOString(),
+          outcome: 'skipped',
+          reason,
+          bot: bot.id,
+          subscriber_id: subscriberId ?? null,
+          first_name: firstName ?? null,
+          ig_username: igUsername ?? null,
+          user_text: userText ?? null,
+          raw_json: rawJsonPreview(body)
+        });
+        return res.status(400).json({
+          status: 'error',
+          reason: 'Missing sender_id or text in body'
+        });
+      }
+
+      console.log(`👤 [${bot.id}/${subscriberId}] User says: "${userText}"`);
+
+      const messages = await getHistory(bot.id, subscriberId, firstName, igUsername);
+      messages.push({ role: 'user', content: userText });
+      trimHistory(messages);
+      await saveConversation(bot.id, subscriberId, messages);
+
+      const dueAt = await schedulePending(bot.id, subscriberId, {
+        firstName,
+        igUsername,
+        path: req.path
+      });
+
       pushTrigger({
         id: triggerId,
         at: new Date().toISOString(),
-        outcome: 'skipped',
-        reason,
+        outcome: 'queued',
+        bot: bot.id,
+        subscriber_id: subscriberId,
+        first_name: firstName ?? null,
+        ig_username: igUsername ?? null,
+        user_text: userText,
+        scheduled_for: new Date(dueAt).toISOString(),
+        raw_json: rawJsonPreview(body)
+      });
+
+      return res.status(202).json({
+        status: 'queued',
+        bot: bot.id,
+        scheduled_for: new Date(dueAt).toISOString(),
+        sender_id: subscriberId
+      });
+    } catch (err) {
+      const detail = err.response?.data || err.message;
+      console.error('❌ Webhook error:', detail);
+      const body = req.body;
+      const { subscriberId, userText, firstName, igUsername } = extractWebhookFields(body || {});
+      pushTrigger({
+        id: triggerId,
+        at: new Date().toISOString(),
+        outcome: 'error',
+        bot: bot ? bot.id : botId,
         subscriber_id: subscriberId ?? null,
         first_name: firstName ?? null,
         ig_username: igUsername ?? null,
         user_text: userText ?? null,
-        raw_json: rawJsonPreview(body)
+        error: typeof detail === 'string' ? detail.slice(0, 500) : rawJsonPreview(detail, 800),
+        raw_json: rawJsonPreview(body || {})
       });
-      return res.status(400).json({
-        status: 'error',
-        reason: 'Missing sender_id or text in body'
-      });
+      return res.status(500).json({ error: 'Internal server error', detail });
     }
+  };
+}
 
-    console.log(`👤 [${subscriberId}] User says: "${userText}"`);
+// ── Routes ───────────────────────────────────────────────────────────────────
+// Per-bot routes (preferred): /webhook/uchat/esma, /webhook/uchat/sara, …
+for (const botId of listBotIds()) {
+  const handler = makeWebhookHandler(botId);
+  app.post(`/webhook/uchat/${botId}`, handler);
+  app.post(`/webhook/${botId}`, handler);
+}
 
-    const messages = await getHistory(subscriberId, firstName, igUsername);
-    messages.push({ role: 'user', content: userText });
-    trimHistory(messages);
-    await saveConversation(subscriberId, messages);
+// Backward-compat: stari URL-ovi i dalje gađaju default (Esma)
+const defaultHandler = makeWebhookHandler(DEFAULT_BOT_ID);
+app.post('/webhook', defaultHandler);
+app.post('/webhook/', defaultHandler);
+app.post('/webhook/make', defaultHandler);
+app.post('/webhook/uchat', defaultHandler);
 
-    const dueAt = await schedulePending(subscriberId, {
-      firstName,
-      igUsername,
-      path: req.path
-    });
-
-    pushTrigger({
-      id: triggerId,
-      at: new Date().toISOString(),
-      outcome: 'queued',
-      subscriber_id: subscriberId,
-      first_name: firstName ?? null,
-      ig_username: igUsername ?? null,
-      user_text: userText,
-      scheduled_for: new Date(dueAt).toISOString(),
-      raw_json: rawJsonPreview(body)
-    });
-
-    return res.status(202).json({
-      status: 'queued',
-      scheduled_for: new Date(dueAt).toISOString(),
-      sender_id: subscriberId
-    });
-  } catch (err) {
-    const detail = err.response?.data || err.message;
-    console.error('❌ Webhook error:', detail);
-    const body = req.body;
-    const { subscriberId, userText, firstName, igUsername } = extractWebhookFields(body || {});
-    pushTrigger({
-      id: triggerId,
-      at: new Date().toISOString(),
-      outcome: 'error',
-      subscriber_id: subscriberId ?? null,
-      first_name: firstName ?? null,
-      ig_username: igUsername ?? null,
-      user_text: userText ?? null,
-      error: typeof detail === 'string' ? detail.slice(0, 500) : rawJsonPreview(detail, 800),
-      raw_json: rawJsonPreview(body || {})
-    });
-    return res.status(500).json({ error: 'Internal server error', detail });
-  }
-};
-app.post('/webhook', webhookHandler);
-app.post('/webhook/make', webhookHandler);
-app.post('/webhook/uchat', webhookHandler);
-app.post('/webhook/', webhookHandler);
-
-// Browser šalje GET — webhook je samo POST (Make.com HTTP Request)
+// Browser šalje GET — webhook je samo POST
 const webhookGetInfoHtml = `<!DOCTYPE html>
 <html lang="hr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Webhook — samo POST</title>
 <style>body{font-family:system-ui;max-width:40rem;margin:2rem;line-height:1.5} code{background:#f0f0f0;padding:2px 6px;border-radius:4px}</style>
 </head><body>
 <h1>Ovo nije greška</h1>
-<p><strong>Make.com šalje <code>POST</code></strong> na ovaj URL. Preglednik kad otvoriš link uvijek šalje <strong><code>GET</code></strong>, pa Express nema GET rutu za webhook — zato si prije vidio „Cannot GET”.</p>
+<p><strong>UChat External Request šalje <code>POST</code></strong> na ovaj URL. Preglednik kad otvoriš link uvijek šalje <strong><code>GET</code></strong>, pa Express nema GET rutu za webhook — zato si prije vidio „Cannot GET”.</p>
+<p>Per-bot rute: <code>POST /webhook/uchat/esma</code>, <code>POST /webhook/uchat/sara</code>.</p>
 <p>Za test u browseru otvori: <a href="/">/</a> (health), <a href="/triggers?format=html">/triggers</a> ili <a href="/messages?format=html">/messages</a>.</p>
-<p>U Make.com ostavi URL ovako: <code>POST …/webhook</code> s JSON bodyjem.</p>
 </body></html>`;
 app.get('/webhook', (_req, res) => res.type('html').send(webhookGetInfoHtml));
 app.get('/webhook/make', (_req, res) => res.type('html').send(webhookGetInfoHtml));
 app.get('/webhook/', (_req, res) => res.type('html').send(webhookGetInfoHtml));
+app.get('/webhook/uchat', (_req, res) => res.type('html').send(webhookGetInfoHtml));
+for (const botId of listBotIds()) {
+  app.get(`/webhook/uchat/${botId}`, (_req, res) => res.type('html').send(webhookGetInfoHtml));
+  app.get(`/webhook/${botId}`, (_req, res) => res.type('html').send(webhookGetInfoHtml));
+}
 
 // ── GET / — health check ─────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
-  res.send('Make.com + Grok webhook running 🚀');
+  const lines = listBotIds().map((id) => {
+    const b = BOTS[id];
+    const keyOk = !!b.uchatApiKey;
+    return `  • ${b.displayName} (${b.id}) — POST /webhook/uchat/${b.id} — UChat key ${keyOk ? 'OK' : 'MISSING'}`;
+  });
+  res.type('text').send(`Multi-bot UChat + Grok webhook running 🚀\n\nBots:\n${lines.join('\n')}\n`);
 });
 
-// ── GET /triggers — svi dolazni webhook pozivi (što ManyChat šalje) ───────────
+// ── GET /triggers — svi dolazni webhook pozivi ───────────────────────────────
 app.get('/triggers', (req, res) => {
   if (!assertViewMessagesAuth(req, res)) return;
 
@@ -637,11 +702,11 @@ app.get('/triggers', (req, res) => {
         const raw = esc(t.raw_json || '');
         const namePart = [t.first_name, t.ig_username ? `@${t.ig_username}` : ''].filter(Boolean).join(' ');
         return `<tr><td style="white-space:nowrap">${esc(t.at)}</td><td><code>${esc(
-          t.outcome
-        )}</code></td><td>${esc(t.subscriber_id ?? '')}<br><small style="color:#666">${esc(namePart)}</small></td><td>${esc(
+          t.bot || ''
+        )}</code></td><td><code>${esc(t.outcome)}</code></td><td>${esc(t.subscriber_id ?? '')}<br><small style="color:#666">${esc(namePart)}</small></td><td>${esc(
           (t.user_text || '').slice(0, 120)
         )}</td><td>${esc(t.reason || t.error || t.reply_preview || '')}</td></tr>
-<tr><td colspan="5" style="background:#fafafa;font-size:12px"><details><summary>raw JSON</summary><pre style="white-space:pre-wrap;word-break:break-all;margin:8px 0">${raw}</pre></details></td></tr>`;
+<tr><td colspan="6" style="background:#fafafa;font-size:12px"><details><summary>raw JSON</summary><pre style="white-space:pre-wrap;word-break:break-all;margin:8px 0">${raw}</pre></details></td></tr>`;
       })
       .join('\n');
     res.type('html').send(`<!DOCTYPE html>
@@ -649,9 +714,9 @@ app.get('/triggers', (req, res) => {
 <style>body{font-family:system-ui;margin:1rem;} table{border-collapse:collapse;width:100%} th,td{border:1px solid #ccc;padding:8px;text-align:left} th{background:#f4f4f4} code{font-size:12px}</style>
 </head><body>
 <h1>Dolazni webhookovi (trigeri)</h1>
-<p>Zadnjih ${MAX_TRIGGER_LOG} zahtjeva na <code>POST /webhook</code>. Lokalni test: <code>curl -sS -X POST http://localhost:PORT/webhook -H "Content-Type: application/json" -d '{"sender_id":"123","text":"hi","name":"Dani"}'</code> — onda ovdje moraju biti redovi. <a href="/messages?format=html${tokenQ}">Grok threads →</a></p>
-<table><thead><tr><th>Vrijeme (UTC)</th><th>Ishod</th><th>sender_id</th><th>Tekst</th><th>Napomena</th></tr></thead>
-<tbody>${rows || '<tr><td colspan="5">Još nema triggera — pošalji poruku kad je flow povezan.</td></tr>'}</tbody></table>
+<p>Zadnjih ${MAX_TRIGGER_LOG} zahtjeva. <a href="/messages?format=html${tokenQ}">Threads →</a></p>
+<table><thead><tr><th>Vrijeme (UTC)</th><th>Bot</th><th>Ishod</th><th>sender_id</th><th>Tekst</th><th>Napomena</th></tr></thead>
+<tbody>${rows || '<tr><td colspan="6">Još nema triggera — pošalji poruku kad je flow povezan.</td></tr>'}</tbody></table>
 <p><a href="/triggers?format=json${tokenQ}">JSON</a></p>
 </body></html>`);
     return;
@@ -664,11 +729,11 @@ app.get('/triggers', (req, res) => {
       raw_json_length: raw_json?.length ?? 0,
       raw_json
     })),
-    hint: 'Svaki red = jedan HTTP POST na /webhook. Pogledaj raw_json ako Make.com ne šalje sender_id / text.'
+    hint: 'Svaki red = jedan HTTP POST na /webhook/.... Pogledaj raw_json ako payload nije ispravan.'
   });
 });
 
-// ── GET /messages — list subscribers + counts (in-memory only) ───────────────
+// ── GET /messages — list svih (bot, subscriber) threadova ────────────────────
 app.get('/messages', async (req, res) => {
   if (!assertViewMessagesAuth(req, res)) return;
 
@@ -678,24 +743,26 @@ app.get('/messages', async (req, res) => {
       (typeof req.headers.accept === 'string' &&
         req.headers.accept.includes('text/html'));
 
-    const ids = await listConversationIds();
-    const threadTuples = await Promise.all(
-      ids.map(async (id) => [id, await loadConversation(id)])
-    );
+    const filterBot = req.query.bot ? String(req.query.bot).toLowerCase() : null;
+    const botsToList = filterBot ? [filterBot] : listBotIds();
 
     const rows = [];
-    for (const [id, msgs] of threadTuples) {
-      if (!Array.isArray(msgs)) continue;
-      const nonSys = msgs.filter((m) => m.role !== 'system');
-      const last = nonSys[nonSys.length - 1];
-      rows.push({
-        subscriber_id: id,
-        message_count: nonSys.length,
-        last_role: last?.role,
-        last_preview: last?.content
-          ? String(last.content).slice(0, 120)
-          : null
-      });
+    for (const botId of botsToList) {
+      if (!getBot(botId)) continue;
+      const ids = await listConversationIds(botId);
+      const tuples = await Promise.all(ids.map(async (id) => [id, await loadConversation(botId, id)]));
+      for (const [id, msgs] of tuples) {
+        if (!Array.isArray(msgs)) continue;
+        const nonSys = msgs.filter((m) => m.role !== 'system');
+        const last = nonSys[nonSys.length - 1];
+        rows.push({
+          bot: botId,
+          subscriber_id: id,
+          message_count: nonSys.length,
+          last_role: last?.role,
+          last_preview: last?.content ? String(last.content).slice(0, 120) : null
+        });
+      }
     }
 
     if (wantsHtml) {
@@ -710,17 +777,17 @@ app.get('/messages', async (req, res) => {
       const lines = rows
         .map(
           (r) =>
-            `<tr><td><a href="/messages/${encodeURIComponent(r.subscriber_id)}?format=html${VIEW_MESSAGES_TOKEN ? `&token=${encodeURIComponent(VIEW_MESSAGES_TOKEN)}` : ''}">${esc(r.subscriber_id)}</a></td><td>${r.message_count}</td><td>${esc(r.last_role || '')}</td><td>${esc(r.last_preview || '')}</td></tr>`
+            `<tr><td><code>${esc(r.bot)}</code></td><td><a href="/messages/${encodeURIComponent(r.bot)}/${encodeURIComponent(r.subscriber_id)}?format=html${tokenQ}">${esc(r.subscriber_id)}</a></td><td>${r.message_count}</td><td>${esc(r.last_role || '')}</td><td>${esc(r.last_preview || '')}</td></tr>`
         )
         .join('\n');
       res.type('html').send(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Grok threads</title>
 <style>body{font-family:system-ui;margin:1rem;} table{border-collapse:collapse;width:100%} th,td{border:1px solid #ccc;padding:8px;text-align:left} th{background:#f4f4f4}</style>
 </head><body>
-<h1>In-memory threads</h1>
-<p>Only conversations that hit this server while it is running. ${VIEW_MESSAGES_TOKEN ? 'Token required.' : ''} <a href="/triggers?format=html${tokenQ}">Dolazni triggeri →</a></p>
-<table><thead><tr><th>Subscriber</th><th>Msgs</th><th>Last role</th><th>Preview</th></tr></thead>
-<tbody>${lines || '<tr><td colspan="4">No messages yet</td></tr>'}</tbody></table>
+<h1>${redisEnabled ? 'Redis' : 'In-memory'} threads</h1>
+<p>${VIEW_MESSAGES_TOKEN ? 'Token required.' : ''} <a href="/triggers?format=html${tokenQ}">Dolazni triggeri →</a></p>
+<table><thead><tr><th>Bot</th><th>Subscriber</th><th>Msgs</th><th>Last role</th><th>Preview</th></tr></thead>
+<tbody>${lines || '<tr><td colspan="5">No messages yet</td></tr>'}</tbody></table>
 <p><a href="/messages?format=json${tokenQ}">JSON</a></p>
 </body></html>`);
       return;
@@ -729,7 +796,7 @@ app.get('/messages', async (req, res) => {
     res.json({
       count: rows.length,
       subscribers: rows,
-      hint: 'GET /messages/:subscriber_id for full thread; add ?format=html for simple UI'
+      hint: 'GET /messages/:botId/:subscriber_id for full thread; ?bot=esma to filter; ?format=html for UI'
     });
   } catch (err) {
     console.error('❌ /messages error:', err.message);
@@ -737,14 +804,16 @@ app.get('/messages', async (req, res) => {
   }
 });
 
-// ── GET /messages/:subscriberId — one thread (redacted system) ───────────────
-app.get('/messages/:subscriberId', async (req, res) => {
-  if (!assertViewMessagesAuth(req, res)) return;
+// ── GET /messages/:botId/:subscriberId — one thread ──────────────────────────
+async function renderThread(req, res, botId, subscriberId) {
+  const bot = getBot(botId);
+  if (!bot) {
+    return res.status(404).json({ error: 'Unknown bot id', bot: botId });
+  }
 
-  const id = req.params.subscriberId;
-  const msgs = await loadConversation(id);
+  const msgs = await loadConversation(bot.id, subscriberId);
   if (!msgs) {
-    return res.status(404).json({ error: 'Unknown subscriber_id', subscriber_id: id });
+    return res.status(404).json({ error: 'Unknown subscriber_id', bot: bot.id, subscriber_id: subscriberId });
   }
 
   const wantsHtml =
@@ -770,20 +839,38 @@ app.get('/messages/:subscriberId', async (req, res) => {
       )
       .join('\n');
     res.type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Thread ${esc(id)}</title>
+<html><head><meta charset="utf-8"><title>Thread ${esc(bot.id)}/${esc(subscriberId)}</title>
 <style>body{font-family:system-ui;margin:1rem;max-width:720px}</style>
 </head><body>
 <p><a href="/messages?format=html${tokenQ}">← All threads</a></p>
-<h1>Subscriber ${esc(id)}</h1>
+<h1>${esc(bot.displayName)} · ${esc(subscriberId)}</h1>
 ${blocks}
 </body></html>`);
     return;
   }
 
-  res.json({ subscriber_id: id, messages: view });
+  res.json({ bot: bot.id, subscriber_id: subscriberId, messages: view });
+}
+
+app.get('/messages/:botId/:subscriberId', async (req, res) => {
+  if (!assertViewMessagesAuth(req, res)) return;
+  await renderThread(req, res, req.params.botId, req.params.subscriberId);
 });
 
-// POST na krivi URL (npr. / umjesto /webhook) — zapiši u triggere radi debuga
+// Backward-compat: /messages/:subscriberId → default bot
+app.get('/messages/:subscriberId', async (req, res) => {
+  if (!assertViewMessagesAuth(req, res)) return;
+  // Ako je :subscriberId zapravo botId, redirect na listing tog bota
+  if (getBot(req.params.subscriberId)) {
+    const tokenQ = VIEW_MESSAGES_TOKEN
+      ? `&token=${encodeURIComponent(VIEW_MESSAGES_TOKEN)}`
+      : '';
+    return res.redirect(`/messages?bot=${req.params.subscriberId}&format=${req.query.format || 'json'}${tokenQ}`);
+  }
+  await renderThread(req, res, DEFAULT_BOT_ID, req.params.subscriberId);
+});
+
+// POST na krivi URL — zapiši u triggere radi debuga
 app.use((req, res, next) => {
   if (req.method !== 'POST') return next();
   const triggerId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
@@ -791,15 +878,16 @@ app.use((req, res, next) => {
     id: triggerId,
     at: new Date().toISOString(),
     outcome: 'wrong_path',
-    reason: `POST ${req.path} — koristi POST .../webhook`,
+    reason: `POST ${req.path} — koristi POST .../webhook/uchat/<bot>`,
     subscriber_id: null,
     user_text: null,
     raw_json: rawJsonPreview(req.body || {})
   });
   return res.status(404).json({
-    error: 'Use POST /webhook',
+    error: 'Use POST /webhook/uchat/<bot>',
     path: req.path,
-    hint: 'ManyChat External Request URL mora završavati na /webhook'
+    bots: listBotIds(),
+    hint: 'Per-bot URL: /webhook/uchat/esma ili /webhook/uchat/sara'
   });
 });
 
@@ -830,15 +918,20 @@ async function startServer() {
 
   app.listen(PORT, () => {
     console.log(`\n🟢 Webhook server running on http://localhost:${PORT}`);
-    console.log(`   POST /webhook  ← Make.com HTTP Request`);
-    console.log(`   GET  /         ← Health check`);
+    for (const botId of listBotIds()) {
+      const b = BOTS[botId];
+      const keyOk = !!b.uchatApiKey;
+      console.log(`   POST /webhook/uchat/${b.id}  ← ${b.displayName} (UChat key ${keyOk ? 'OK' : 'MISSING'})`);
+    }
+    console.log(`   POST /webhook                ← legacy alias → ${DEFAULT_BOT_ID}`);
+    console.log(`   GET  /                       ← Health check`);
     console.log(
-      `   GET  /messages?format=html  ← View ${redisEnabled ? 'Redis-backed' : 'in-memory'} Grok threads${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
+      `   GET  /messages?format=html   ← View ${redisEnabled ? 'Redis-backed' : 'in-memory'} Grok threads${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
     );
     console.log(
-      `   GET  /triggers?format=html  ← Dolazni POST /webhook (što Make.com šalje)${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
+      `   GET  /triggers?format=html   ← Dolazni POST /webhook${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
     );
-    console.log(`   Tip: npm run dev:public  → Serveo HTTPS URL (or TUNNEL=pinggy)\n`);
+    console.log(`   Tip: npm run dev:public      → Public HTTPS URL (TUNNEL=serveo|pinggy|cloudflare)\n`);
   });
 }
 
