@@ -14,9 +14,24 @@ const GROK_URL = 'https://api.x.ai/v1/chat/completions';
 const GROK_MODEL = process.env.GROK_MODEL || 'grok-4';
 
 const UCHAT_URL = 'https://www.uchat.com.au/api/subscriber/send-text';
+const UCHAT_HISTORY_URL = 'https://www.uchat.com.au/api/subscriber/chat-messages';
 const REDIS_URL = process.env.REDIS_URL;
 const REDIS_KEY_PREFIX = process.env.REDIS_KEY_PREFIX || 'autodms';
 const REQUIRE_REDIS = String(process.env.REQUIRE_REDIS || '').toLowerCase() === 'true';
+
+// Auto-import last UChat messages into Redis on first webhook for a subscriber.
+const UCHAT_HISTORY_IMPORT_ENABLED =
+  String(process.env.UCHAT_HISTORY_IMPORT_ENABLED || 'true').toLowerCase() !== 'false';
+const UCHAT_HISTORY_IMPORT_LIMIT = (() => {
+  const raw = parseInt(process.env.UCHAT_HISTORY_IMPORT_LIMIT || '', 10);
+  if (Number.isFinite(raw) && raw > 0) return Math.min(raw, 100);
+  return 15;
+})();
+const UCHAT_HISTORY_TIMEOUT_MS = (() => {
+  const raw = parseInt(process.env.UCHAT_HISTORY_TIMEOUT_MS || '', 10);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return 12000;
+})();
 
 /** If set, GET /messages* requires ?token=... or X-View-Token header (use when tunneling). */
 const VIEW_MESSAGES_TOKEN = process.env.VIEW_MESSAGES_TOKEN;
@@ -148,6 +163,12 @@ function isInvalidUchatUserNsError(detail) {
     .some((v) => v.includes('user ns format is invalid'));
 }
 
+function isMissingUchatBotUserError(detail) {
+  if (!detail) return false;
+  const message = typeof detail === 'string' ? detail : detail.message || detail.error || '';
+  return String(message).toLowerCase().includes('no query results for model [app\\models\\chatbot\\botuser]');
+}
+
 function isKnownTestSubscriberId(subscriberId) {
   const id = String(subscriberId || '').trim().toLowerCase();
   if (!id) return true;
@@ -158,6 +179,108 @@ function isKnownTestSubscriberId(subscriberId) {
     /^test_(esma|sara)_/.test(id) ||
     /_test_\d+$/.test(id)
   );
+}
+
+// ── UChat chat-messages import (one-shot bootstrap) ──────────────────────────
+async function fetchUchatChatMessages(bot, subscriberId, limit) {
+  const response = await axios.get(UCHAT_HISTORY_URL, {
+    params: {
+      user_ns: subscriberId,
+      include_bot: 1,
+      include_note: 0,
+      include_system: 0,
+      limit
+    },
+    headers: {
+      Accept: 'application/json',
+      Authorization: `Bearer ${bot.uchatApiKey}`
+    },
+    timeout: UCHAT_HISTORY_TIMEOUT_MS
+  });
+  const data = response.data?.data;
+  return Array.isArray(data) ? data : [];
+}
+
+function normalizeUchatMessages(rawMessages, latestUserText, limit) {
+  if (!Array.isArray(rawMessages) || rawMessages.length === 0) return [];
+
+  const textOnly = rawMessages.filter((m) => {
+    if (!m || typeof m !== 'object') return false;
+    if (m.msg_type && String(m.msg_type).toLowerCase() !== 'text') return false;
+    const content = typeof m.content === 'string'
+      ? m.content
+      : typeof m?.payload?.text === 'string' ? m.payload.text : '';
+    return content.trim().length > 0;
+  });
+
+  textOnly.sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0));
+
+  const mapped = textOnly.map((m) => {
+    const type = String(m.type || '').toLowerCase();
+    const role = type === 'in' ? 'user' : 'assistant';
+    const content = typeof m.content === 'string' && m.content.trim()
+      ? m.content.trim()
+      : String(m?.payload?.text || '').trim();
+    return { role, content };
+  });
+
+  const safeLimit = Math.max(1, Number(limit) || 15);
+  const tail = mapped.slice(-safeLimit);
+
+  if (tail.length && latestUserText && tail[tail.length - 1].role === 'user') {
+    const last = tail[tail.length - 1].content.trim().toLowerCase();
+    const incoming = String(latestUserText).trim().toLowerCase();
+    if (last === incoming) tail.pop();
+  }
+
+  return tail;
+}
+
+async function bootstrapHistoryForNewConversation(bot, subscriberId, customPrompt, latestUserText) {
+  const baseMessages = [{ role: 'system', content: customPrompt }];
+
+  if (!UCHAT_HISTORY_IMPORT_ENABLED) {
+    return { messages: baseMessages, importStatus: { status: 'disabled', count: 0 } };
+  }
+  if (!bot.uchatApiKey) {
+    return {
+      messages: baseMessages,
+      importStatus: { status: 'skipped', reason: 'no_uchat_key', count: 0 }
+    };
+  }
+  if (isKnownTestSubscriberId(subscriberId)) {
+    return {
+      messages: baseMessages,
+      importStatus: { status: 'skipped', reason: 'test_subscriber', count: 0 }
+    };
+  }
+
+  try {
+    const raw = await fetchUchatChatMessages(bot, subscriberId, UCHAT_HISTORY_IMPORT_LIMIT);
+    const normalized = normalizeUchatMessages(raw, latestUserText, UCHAT_HISTORY_IMPORT_LIMIT);
+    if (!normalized.length) {
+      return {
+        messages: baseMessages,
+        importStatus: { status: 'empty', count: 0, raw_count: raw.length }
+      };
+    }
+    const merged = [...baseMessages, ...normalized];
+    trimHistory(merged);
+    return {
+      messages: merged,
+      importStatus: { status: 'imported', count: normalized.length, raw_count: raw.length }
+    };
+  } catch (err) {
+    const detail = err.response?.data || err.message;
+    const errorPreview = typeof detail === 'string'
+      ? detail.slice(0, 300)
+      : rawJsonPreview(detail, 300);
+    console.warn(`⚠️  [${bot.id}/${subscriberId}] UChat history import failed: ${errorPreview}`);
+    return {
+      messages: baseMessages,
+      importStatus: { status: 'failed', count: 0, error: errorPreview }
+    };
+  }
 }
 
 function countUserMessages(messages) {
@@ -419,18 +542,19 @@ async function flushPending(botId, subscriberId) {
   } catch (err) {
     const detail = err.response?.data || err.message;
     console.error(`❌ Flush failed [${bot.id}/${subscriberId}]:`, detail);
-    if (isInvalidUchatUserNsError(detail)) {
+    if (isInvalidUchatUserNsError(detail) || isMissingUchatBotUserError(detail)) {
+      const reason = isInvalidUchatUserNsError(detail) ? 'invalid_user_ns' : 'missing_uchat_bot_user';
       await clearPending(bot.id, subscriberId);
       pushTrigger({
         id: `${Date.now()}-discard-${Math.random().toString(36).slice(2, 9)}`,
         at: new Date().toISOString(),
         outcome: 'discarded',
-        reason: 'invalid_user_ns',
+        reason,
         bot: bot.id,
         subscriber_id: subscriberId,
         error: typeof detail === 'string' ? detail.slice(0, 500) : rawJsonPreview(detail, 800)
       });
-      console.warn(`🧹 [${bot.id}/${subscriberId}] Cleared pending message because UChat rejected user_ns`);
+      console.warn(`🧹 [${bot.id}/${subscriberId}] Cleared pending message because UChat rejected this subscriber`);
     }
   } finally {
     await releaseFlushLock(botId, subscriberId);
@@ -458,21 +582,37 @@ function startPendingWorker() {
   );
 }
 
-// Get or create conversation history for a (bot, subscriber) pair
-async function getHistory(botId, subscriberId, firstName, igUsername) {
+// Get or create conversation history for a (bot, subscriber) pair.
+// On first creation, attempts a one-shot import of the last UChat messages
+// so Grok continues the chat instead of starting from scratch.
+async function getHistory(botId, subscriberId, firstName, igUsername, latestUserText) {
   const bot = getBot(botId);
-  let existing = await loadConversation(botId, subscriberId);
-  if (!existing) {
-    let customPrompt = bot.prompt;
-    if (firstName || igUsername) {
-      const namePart = [firstName, igUsername ? `(@${igUsername})` : ''].filter(Boolean).join(' ');
-      customPrompt += `\nYou are currently talking to: ${namePart}.`;
-    }
-
-    existing = [{ role: 'system', content: customPrompt }];
-    await saveConversation(botId, subscriberId, existing);
+  const existing = await loadConversation(botId, subscriberId);
+  if (existing) {
+    return { messages: existing, importStatus: null };
   }
-  return existing;
+
+  let customPrompt = bot.prompt;
+  if (firstName || igUsername) {
+    const namePart = [firstName, igUsername ? `(@${igUsername})` : ''].filter(Boolean).join(' ');
+    customPrompt += `\nYou are currently talking to: ${namePart}.`;
+  }
+
+  const { messages, importStatus } = await bootstrapHistoryForNewConversation(
+    bot,
+    subscriberId,
+    customPrompt,
+    latestUserText
+  );
+  await saveConversation(botId, subscriberId, messages);
+
+  if (importStatus?.status === 'imported') {
+    console.log(
+      `📚 [${bot.id}/${subscriberId}] Imported ${importStatus.count} prior UChat message(s) into history`
+    );
+  }
+
+  return { messages, importStatus };
 }
 
 // Trim history (keep optional system at [0]; otherwise last MAX_HISTORY user/assistant msgs)
@@ -587,6 +727,144 @@ function redactMessagesForView(messages) {
   );
 }
 
+// ── Admin / debug helpers ────────────────────────────────────────────────────
+
+function escHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function tokenQuerySuffix() {
+  return VIEW_MESSAGES_TOKEN ? `&token=${encodeURIComponent(VIEW_MESSAGES_TOKEN)}` : '';
+}
+
+function tokenQueryFirst() {
+  return VIEW_MESSAGES_TOKEN ? `?token=${encodeURIComponent(VIEW_MESSAGES_TOKEN)}` : '';
+}
+
+function wantsHtmlResponse(req) {
+  return (
+    req.query.format === 'html' ||
+    (typeof req.headers.accept === 'string' && req.headers.accept.includes('text/html'))
+  );
+}
+
+function adminPageShell(title, bodyHtml) {
+  const tokenQ = tokenQuerySuffix();
+  return `<!DOCTYPE html>
+<html lang="hr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escHtml(title)}</title>
+<style>
+  body{font-family:system-ui;margin:1rem;max-width:1100px}
+  h1{margin-bottom:.25rem}
+  nav a{margin-right:.6rem}
+  table{border-collapse:collapse;width:100%;margin-top:.5rem}
+  th,td{border:1px solid #ccc;padding:.5rem;text-align:left;vertical-align:top;font-size:14px}
+  th{background:#f4f4f4}
+  code,pre{background:#f6f8fa;padding:2px 6px;border-radius:4px;font-size:12px}
+  pre{padding:.5rem;white-space:pre-wrap;word-break:break-all}
+  .muted{color:#666;font-size:12px}
+  .ok{color:#117a3a;font-weight:600}
+  .bad{color:#a00;font-weight:600}
+  .pill{display:inline-block;padding:1px 6px;border-radius:8px;background:#eef;font-size:12px}
+</style>
+</head><body>
+<nav>
+  <a href="/admin?format=html${tokenQ}">Admin</a>
+  <a href="/bots?format=html${tokenQ}">Bots</a>
+  <a href="/conversations?format=html${tokenQ}">Conversations</a>
+  <a href="/pending?format=html${tokenQ}">Pending</a>
+  <a href="/failed?format=html${tokenQ}">Failed</a>
+  <a href="/messages?format=html${tokenQ}">Messages</a>
+  <a href="/triggers?format=html${tokenQ}">Triggers</a>
+</nav>
+<h1>${escHtml(title)}</h1>
+${bodyHtml}
+</body></html>`;
+}
+
+async function collectBotsStatus() {
+  const rows = [];
+  for (const id of listBotIds()) {
+    const bot = BOTS[id];
+    const conversationIds = await listConversationIds(id);
+    const pendingIds = await listPendingIds(id);
+    rows.push({
+      id: bot.id,
+      display_name: bot.displayName,
+      timezone: bot.timezone,
+      uchat_key: bot.uchatApiKey ? 'present' : 'missing',
+      route: `/webhook/uchat/${bot.id}`,
+      conversation_count: conversationIds.length,
+      pending_count: pendingIds.length
+    });
+  }
+  return rows;
+}
+
+async function collectAllConversations(filterBotId) {
+  const botsToList = filterBotId
+    ? (getBot(filterBotId) ? [filterBotId.toLowerCase()] : [])
+    : listBotIds();
+  const rows = [];
+  for (const botId of botsToList) {
+    const ids = await listConversationIds(botId);
+    const tuples = await Promise.all(ids.map(async (id) => [id, await loadConversation(botId, id)]));
+    for (const [id, msgs] of tuples) {
+      if (!Array.isArray(msgs)) continue;
+      const nonSys = msgs.filter((m) => m.role !== 'system');
+      const last = nonSys[nonSys.length - 1];
+      rows.push({
+        bot: botId,
+        subscriber_id: id,
+        message_count: nonSys.length,
+        last_role: last?.role || null,
+        last_preview: last?.content ? String(last.content).slice(0, 120) : null
+      });
+    }
+  }
+  return rows;
+}
+
+async function collectAllPending(filterBotId) {
+  const botsToList = filterBotId
+    ? (getBot(filterBotId) ? [filterBotId.toLowerCase()] : [])
+    : listBotIds();
+  const now = Date.now();
+  const rows = [];
+  for (const botId of botsToList) {
+    const ids = await listPendingIds(botId);
+    const tuples = await Promise.all(ids.map(async (id) => [id, await loadPending(botId, id)]));
+    for (const [id, payload] of tuples) {
+      if (!payload || typeof payload !== 'object') continue;
+      const dueAt = Number(payload.dueAt) || 0;
+      const remainingMs = dueAt - now;
+      rows.push({
+        bot: botId,
+        subscriber_id: id,
+        first_name: payload.firstName || null,
+        ig_username: payload.igUsername || null,
+        path: payload.path || null,
+        due_at: dueAt ? new Date(dueAt).toISOString() : null,
+        wait_remaining_ms: remainingMs,
+        wait_remaining_human: remainingMs > 0 ? formatDelay(remainingMs) : 'overdue'
+      });
+    }
+  }
+  rows.sort((a, b) => (a.wait_remaining_ms || 0) - (b.wait_remaining_ms || 0));
+  return rows;
+}
+
+const FAILED_OUTCOMES = new Set(['error', 'skipped', 'discarded', 'wrong_path']);
+
+function collectFailedTriggers() {
+  return triggerLog.filter((t) => FAILED_OUTCOMES.has(t.outcome));
+}
+
 // ── Webhook handler factory (per-bot route → shared logic) ───────────────────
 function makeWebhookHandler(botId) {
   return async (req, res) => {
@@ -641,7 +919,13 @@ function makeWebhookHandler(botId) {
 
       console.log(`👤 [${bot.id}/${subscriberId}] User says: "${userText}"`);
 
-      const messages = await getHistory(bot.id, subscriberId, firstName, igUsername);
+      const { messages, importStatus } = await getHistory(
+        bot.id,
+        subscriberId,
+        firstName,
+        igUsername,
+        userText
+      );
       messages.push({ role: 'user', content: userText });
       trimHistory(messages);
       await saveConversation(bot.id, subscriberId, messages);
@@ -666,6 +950,7 @@ function makeWebhookHandler(botId) {
         ig_username: igUsername ?? null,
         user_text: userText,
         scheduled_for: new Date(dueAt).toISOString(),
+        import_status: importStatus || null,
         raw_json: rawJsonPreview(body)
       });
 
@@ -761,6 +1046,14 @@ app.get('/triggers', (req, res) => {
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
+    const formatImport = (s) => {
+      if (!s || typeof s !== 'object') return '';
+      const parts = [s.status];
+      if (typeof s.count === 'number') parts.push(`${s.count} msg`);
+      if (s.reason) parts.push(s.reason);
+      if (s.error) parts.push(s.error.slice(0, 80));
+      return parts.filter(Boolean).join(' · ');
+    };
     const rows = triggerLog
       .map((t) => {
         const raw = esc(t.raw_json || '');
@@ -769,8 +1062,8 @@ app.get('/triggers', (req, res) => {
           t.bot || ''
         )}</code></td><td><code>${esc(t.outcome)}</code></td><td>${esc(t.subscriber_id ?? '')}<br><small style="color:#666">${esc(namePart)}</small></td><td>${esc(
           (t.user_text || '').slice(0, 120)
-        )}</td><td>${esc(t.reason || t.error || t.reply_preview || '')}</td></tr>
-<tr><td colspan="6" style="background:#fafafa;font-size:12px"><details><summary>raw JSON</summary><pre style="white-space:pre-wrap;word-break:break-all;margin:8px 0">${raw}</pre></details></td></tr>`;
+        )}</td><td>${esc(formatImport(t.import_status))}</td><td>${esc(t.reason || t.error || t.reply_preview || '')}</td></tr>
+<tr><td colspan="7" style="background:#fafafa;font-size:12px"><details><summary>raw JSON</summary><pre style="white-space:pre-wrap;word-break:break-all;margin:8px 0">${raw}</pre></details></td></tr>`;
       })
       .join('\n');
     res.type('html').send(`<!DOCTYPE html>
@@ -779,8 +1072,8 @@ app.get('/triggers', (req, res) => {
 </head><body>
 <h1>Dolazni webhookovi (trigeri)</h1>
 <p>Zadnjih ${MAX_TRIGGER_LOG} zahtjeva. <a href="/messages?format=html${tokenQ}">Threads →</a></p>
-<table><thead><tr><th>Vrijeme (UTC)</th><th>Bot</th><th>Ishod</th><th>sender_id</th><th>Tekst</th><th>Napomena</th></tr></thead>
-<tbody>${rows || '<tr><td colspan="6">Još nema triggera — pošalji poruku kad je flow povezan.</td></tr>'}</tbody></table>
+<table><thead><tr><th>Vrijeme (UTC)</th><th>Bot</th><th>Ishod</th><th>sender_id</th><th>Tekst</th><th>Import</th><th>Napomena</th></tr></thead>
+<tbody>${rows || '<tr><td colspan="7">Još nema triggera — pošalji poruku kad je flow povezan.</td></tr>'}</tbody></table>
 <p><a href="/triggers?format=json${tokenQ}">JSON</a></p>
 </body></html>`);
     return;
@@ -934,6 +1227,229 @@ app.get('/messages/:subscriberId', async (req, res) => {
   await renderThread(req, res, DEFAULT_BOT_ID, req.params.subscriberId);
 });
 
+// ── Admin / debug panel ──────────────────────────────────────────────────────
+app.get('/admin', async (req, res) => {
+  if (!assertViewMessagesAuth(req, res)) return;
+  const tokenQ = tokenQuerySuffix();
+  const tokenFirst = tokenQueryFirst();
+  const [bots, pending, conversations] = await Promise.all([
+    collectBotsStatus(),
+    collectAllPending(),
+    collectAllConversations()
+  ]);
+  const failed = collectFailedTriggers();
+
+  if (!wantsHtmlResponse(req)) {
+    return res.json({
+      auth_required: !!VIEW_MESSAGES_TOKEN,
+      stats: {
+        bot_count: bots.length,
+        conversation_count: conversations.length,
+        pending_count: pending.length,
+        failed_recent: failed.length
+      },
+      links: {
+        bots: `/bots${tokenFirst}`,
+        conversations: `/conversations${tokenFirst}`,
+        pending: `/pending${tokenFirst}`,
+        failed: `/failed${tokenFirst}`,
+        messages: `/messages${tokenFirst}`,
+        triggers: `/triggers${tokenFirst}`
+      }
+    });
+  }
+
+  const body = `
+    <p class="muted">Read-only dashboard. Use the links above for details.</p>
+    <table>
+      <thead><tr><th>Section</th><th>Count</th><th>Open</th></tr></thead>
+      <tbody>
+        <tr><td>Bots</td><td>${bots.length}</td><td><a href="/bots?format=html${tokenQ}">/bots</a></td></tr>
+        <tr><td>Conversations</td><td>${conversations.length}</td><td><a href="/conversations?format=html${tokenQ}">/conversations</a></td></tr>
+        <tr><td>Pending replies</td><td>${pending.length}</td><td><a href="/pending?format=html${tokenQ}">/pending</a></td></tr>
+        <tr><td>Failed / discarded (recent)</td><td>${failed.length}</td><td><a href="/failed?format=html${tokenQ}">/failed</a></td></tr>
+      </tbody>
+    </table>
+    <p class="muted">Auth: ${VIEW_MESSAGES_TOKEN ? 'token required (?token= or X-View-Token)' : '<span class="bad">no token configured</span>'}</p>
+  `;
+  res.type('html').send(adminPageShell('Admin / Debug', body));
+});
+
+app.get('/bots', async (req, res) => {
+  if (!assertViewMessagesAuth(req, res)) return;
+  const rows = await collectBotsStatus();
+  if (!wantsHtmlResponse(req)) return res.json({ count: rows.length, bots: rows });
+
+  const tokenQ = tokenQuerySuffix();
+  const trs = rows
+    .map((r) => {
+      const keyHtml = r.uchat_key === 'present'
+        ? '<span class="ok">present</span>'
+        : '<span class="bad">missing</span>';
+      return `<tr>
+        <td><code>${escHtml(r.id)}</code></td>
+        <td>${escHtml(r.display_name)}</td>
+        <td>${escHtml(r.timezone)}</td>
+        <td>${keyHtml}</td>
+        <td><code>${escHtml(r.route)}</code></td>
+        <td>${r.conversation_count} <a class="muted" href="/conversations?format=html&bot=${encodeURIComponent(r.id)}${tokenQ}">view</a></td>
+        <td>${r.pending_count} <a class="muted" href="/pending?format=html&bot=${encodeURIComponent(r.id)}${tokenQ}">view</a></td>
+      </tr>`;
+    })
+    .join('');
+
+  const body = `
+    <table>
+      <thead><tr>
+        <th>ID</th><th>Display</th><th>Timezone</th><th>UChat key</th><th>Route</th>
+        <th>Conversations</th><th>Pending</th>
+      </tr></thead>
+      <tbody>${trs || '<tr><td colspan="7" class="muted">No bots configured.</td></tr>'}</tbody>
+    </table>
+  `;
+  res.type('html').send(adminPageShell('Bots', body));
+});
+
+app.get('/conversations', async (req, res) => {
+  if (!assertViewMessagesAuth(req, res)) return;
+  const filterBot = req.query.bot ? String(req.query.bot) : null;
+  const rows = await collectAllConversations(filterBot);
+  if (!wantsHtmlResponse(req)) return res.json({ count: rows.length, bot_filter: filterBot, conversations: rows });
+
+  const tokenQ = tokenQuerySuffix();
+  const trs = rows
+    .map((r) => {
+      const detailHref = `/messages/${encodeURIComponent(r.bot)}/${encodeURIComponent(r.subscriber_id)}?format=html${tokenQ}`;
+      return `<tr>
+        <td><span class="pill">${escHtml(r.bot)}</span></td>
+        <td><code>${escHtml(r.subscriber_id)}</code></td>
+        <td>${r.message_count}</td>
+        <td>${escHtml(r.last_role || '—')}</td>
+        <td>${escHtml(r.last_preview || '')}</td>
+        <td><a href="${detailHref}">open</a></td>
+      </tr>`;
+    })
+    .join('');
+
+  const body = `
+    <p class="muted">${filterBot ? `Filtered by bot: <code>${escHtml(filterBot)}</code>. ` : ''}Conversation history is preserved across prompt/code changes.</p>
+    <table>
+      <thead><tr>
+        <th>Bot</th><th>Subscriber</th><th>Messages</th><th>Last role</th><th>Last preview</th><th></th>
+      </tr></thead>
+      <tbody>${trs || '<tr><td colspan="6" class="muted">No conversations yet.</td></tr>'}</tbody>
+    </table>
+  `;
+  res.type('html').send(adminPageShell('Conversations', body));
+});
+
+app.get('/pending', async (req, res) => {
+  if (!assertViewMessagesAuth(req, res)) return;
+  const filterBot = req.query.bot ? String(req.query.bot) : null;
+  const rows = await collectAllPending(filterBot);
+  if (!wantsHtmlResponse(req)) return res.json({ count: rows.length, bot_filter: filterBot, pending: rows });
+
+  const tokenHeaderTip = VIEW_MESSAGES_TOKEN
+    ? ` -H "X-View-Token: ${VIEW_MESSAGES_TOKEN}"`
+    : '';
+  const baseUrl = `${req.protocol}://${req.get('host')}`;
+  const tokenForCurl = VIEW_MESSAGES_TOKEN
+    ? `?token=${encodeURIComponent(VIEW_MESSAGES_TOKEN)}`
+    : '';
+
+  const trs = rows
+    .map((r) => {
+      const wait = r.wait_remaining_ms > 0
+        ? `${escHtml(r.wait_remaining_human)} <span class="muted">(at ${escHtml(r.due_at || '')})</span>`
+        : `<span class="bad">overdue</span>`;
+      const curlCmd = `curl -X POST "${baseUrl}/clear-pending/${encodeURIComponent(r.bot)}/${encodeURIComponent(r.subscriber_id)}${tokenForCurl}"${tokenHeaderTip}`;
+      return `<tr>
+        <td><span class="pill">${escHtml(r.bot)}</span></td>
+        <td><code>${escHtml(r.subscriber_id)}</code></td>
+        <td>${escHtml(r.first_name || '')}${r.ig_username ? ` <span class="muted">@${escHtml(r.ig_username)}</span>` : ''}</td>
+        <td>${escHtml(r.path || '')}</td>
+        <td>${wait}</td>
+        <td><pre>${escHtml(curlCmd)}</pre></td>
+      </tr>`;
+    })
+    .join('');
+
+  const body = `
+    <p class="muted">Pending replies waiting for debounce. Cleanup is POST-only — copy the command from the last column to clear.</p>
+    <table>
+      <thead><tr>
+        <th>Bot</th><th>Subscriber</th><th>User</th><th>Path</th><th>Wait remaining</th><th>Clear (POST only)</th>
+      </tr></thead>
+      <tbody>${trs || '<tr><td colspan="6" class="muted">No pending replies.</td></tr>'}</tbody>
+    </table>
+  `;
+  res.type('html').send(adminPageShell('Pending', body));
+});
+
+app.get('/failed', (req, res) => {
+  if (!assertViewMessagesAuth(req, res)) return;
+  const items = collectFailedTriggers();
+  if (!wantsHtmlResponse(req)) {
+    return res.json({
+      count: items.length,
+      note: 'Recent in-memory triggerLog only. Restart clears this.',
+      failed: items.map(({ raw_json, ...rest }) => ({ ...rest, raw_json: raw_json || null }))
+    });
+  }
+  const trs = items
+    .map((t) => `<tr>
+      <td>${escHtml(t.at || '')}</td>
+      <td><span class="pill">${escHtml(t.outcome)}</span></td>
+      <td>${escHtml(t.bot || '')}</td>
+      <td><code>${escHtml(t.subscriber_id || '')}</code></td>
+      <td>${escHtml(t.reason || '')}</td>
+      <td>${escHtml(typeof t.error === 'string' ? t.error : (t.error ? JSON.stringify(t.error).slice(0, 300) : ''))}</td>
+      <td><pre>${escHtml(t.raw_json || '')}</pre></td>
+    </tr>`)
+    .join('');
+
+  const body = `
+    <p class="muted">Recent <code>error</code> / <code>skipped</code> / <code>discarded</code> / <code>wrong_path</code> events. In-memory only — clears on restart.</p>
+    <table>
+      <thead><tr>
+        <th>At</th><th>Outcome</th><th>Bot</th><th>Subscriber</th><th>Reason</th><th>Error</th><th>Raw</th>
+      </tr></thead>
+      <tbody>${trs || '<tr><td colspan="7" class="muted">No failed events recorded.</td></tr>'}</tbody>
+    </table>
+  `;
+  res.type('html').send(adminPageShell('Failed / Discarded', body));
+});
+
+// POST-only: clears ONLY the pending reply queue + flush lock for that subscriber.
+// Conversation history is intentionally preserved.
+app.post('/clear-pending/:botId/:subscriberId', async (req, res) => {
+  if (!assertViewMessagesAuth(req, res)) return;
+  const { botId, subscriberId } = req.params;
+  const bot = getBot(botId);
+  if (!bot) {
+    return res.status(404).json({
+      status: 'error',
+      reason: `Unknown bot id "${botId}". Known: ${listBotIds().join(', ')}`
+    });
+  }
+  if (!subscriberId) {
+    return res.status(400).json({ status: 'error', reason: 'Missing subscriberId' });
+  }
+
+  const before = await loadPending(bot.id, subscriberId);
+  await clearPending(bot.id, subscriberId);
+  await releaseFlushLock(bot.id, subscriberId);
+
+  console.log(`🧹 [admin] Cleared pending [${bot.id}/${subscriberId}] (had=${!!before})`);
+  return res.json({
+    status: 'ok',
+    bot: bot.id,
+    subscriber_id: subscriberId,
+    had_pending: !!before,
+    note: 'Conversation history preserved.'
+  });
+});
+
 // POST na krivi URL — zapiši u triggere radi debuga
 app.use((req, res, next) => {
   if (req.method !== 'POST') return next();
@@ -994,6 +1510,9 @@ async function startServer() {
     );
     console.log(
       `   GET  /triggers?format=html   ← Dolazni POST /webhook${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
+    );
+    console.log(
+      `   GET  /admin?format=html      ← Admin / debug panel${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
     );
     console.log(`   Tip: npm run dev:public      → Public HTTPS URL (TUNNEL=serveo|pinggy|cloudflare)\n`);
   });
