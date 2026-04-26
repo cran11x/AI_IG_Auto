@@ -767,18 +767,33 @@ function adminPageShell(title, bodyHtml) {
 <html lang="hr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escHtml(title)}</title>
 <style>
-  body{font-family:system-ui;margin:1rem;max-width:1100px}
-  h1{margin-bottom:.25rem}
-  nav a{margin-right:.6rem}
-  table{border-collapse:collapse;width:100%;margin-top:.5rem}
+  *{box-sizing:border-box}
+  html{background:#f7f8fb}
+  body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0 auto;padding:1rem;max-width:1100px;color:#111827}
+  h1{margin:.9rem 0 .35rem;font-size:clamp(1.45rem,6vw,2rem);line-height:1.1}
+  nav{position:sticky;top:0;z-index:10;display:flex;gap:.45rem;overflow-x:auto;padding:.65rem .2rem .7rem;margin:-1rem -1rem .8rem;background:rgba(247,248,251,.96);backdrop-filter:blur(8px);border-bottom:1px solid #e5e7eb}
+  nav a{flex:0 0 auto;display:inline-flex;align-items:center;min-height:38px;padding:.45rem .7rem;border:1px solid #dbe1ea;border-radius:999px;background:#fff;color:#111827;text-decoration:none;font-size:14px;font-weight:650;box-shadow:0 1px 2px rgba(16,24,40,.04)}
+  nav a:active{transform:translateY(1px)}
+  table{border-collapse:collapse;width:100%;min-width:720px;margin-top:.5rem;background:#fff}
   th,td{border:1px solid #ccc;padding:.5rem;text-align:left;vertical-align:top;font-size:14px}
   th{background:#f4f4f4}
   code,pre{background:#f6f8fa;padding:2px 6px;border-radius:4px;font-size:12px}
-  pre{padding:.5rem;white-space:pre-wrap;word-break:break-all}
+  pre{padding:.5rem;white-space:pre-wrap;word-break:break-word;max-width:100%;overflow-x:auto}
+  table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:12px;box-shadow:0 1px 3px rgba(16,24,40,.08)}
+  tbody,thead,tr{width:100%}
   .muted{color:#666;font-size:12px}
   .ok{color:#117a3a;font-weight:600}
   .bad{color:#a00;font-weight:600}
   .pill{display:inline-block;padding:1px 6px;border-radius:8px;background:#eef;font-size:12px}
+  @media (max-width:640px){
+    body{padding:.8rem;font-size:15px}
+    nav{margin:-.8rem -.8rem .75rem;padding:.6rem .75rem}
+    nav a{min-height:42px;padding:.55rem .78rem;font-size:13px}
+    p{line-height:1.45}
+    th,td{padding:.65rem .55rem;font-size:13px}
+    code,pre{font-size:11px}
+    table{min-width:680px}
+  }
 </style>
 </head><body>
 <nav>
