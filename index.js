@@ -893,12 +893,20 @@ function adminPageShell(title, bodyHtml) {
   .nowrap{white-space:nowrap}
   @media (max-width:640px){
     body{padding:.8rem;font-size:15px}
-    nav{margin:-.8rem -.8rem .75rem;padding:.6rem .75rem}
-    nav a{min-height:42px;padding:.55rem .78rem;font-size:13px}
+    nav{margin:-.8rem -.8rem .75rem;padding:.6rem .75rem;flex-wrap:wrap;overflow-x:visible}
+    nav a{min-height:42px;padding:.55rem .78rem;font-size:13px;flex:1 1 auto;justify-content:center}
     p{line-height:1.45}
-    th,td{padding:.65rem .55rem;font-size:13px}
     code,pre{font-size:11px}
-    table{min-width:680px}
+    table{display:block;min-width:0;width:100%;overflow:visible;background:transparent;box-shadow:none;border-radius:0}
+    thead{display:none}
+    tbody{display:block;width:100%}
+    tr{display:block;width:100%;margin:.75rem 0;padding:.15rem 0;background:#fff;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 1px 3px rgba(16,24,40,.08);overflow:hidden}
+    td{display:block;width:100%;border:0;border-bottom:1px solid #eef2f7;padding:.65rem .75rem;font-size:13px}
+    td:last-child{border-bottom:0}
+    td::before{content:attr(data-label);display:block;margin-bottom:.22rem;color:#667085;font-size:11px;font-weight:750;letter-spacing:.02em;text-transform:uppercase}
+    td[colspan]::before{display:none}
+    td[colspan]{background:#fafafa}
+    .subscriber{min-width:0}
     .button{min-height:42px}
     .bubble{max-width:100%;border-radius:14px}
     .avatar{width:34px;height:34px}
@@ -917,6 +925,16 @@ function adminPageShell(title, bodyHtml) {
 </nav>
 <h1>${escHtml(title)}</h1>
 ${bodyHtml}
+<script>
+  document.querySelectorAll('table').forEach((table) => {
+    const labels = Array.from(table.querySelectorAll('thead th')).map((th) => th.textContent.trim());
+    table.querySelectorAll('tbody tr').forEach((row) => {
+      Array.from(row.children).forEach((cell, index) => {
+        if (!cell.hasAttribute('data-label') && labels[index]) cell.setAttribute('data-label', labels[index]);
+      });
+    });
+  });
+</script>
 </body></html>`;
 }
 
