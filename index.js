@@ -770,6 +770,7 @@ function adminPageShell(title, bodyHtml) {
   *{box-sizing:border-box}
   html{background:#f7f8fb}
   body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0 auto;padding:1rem;max-width:1100px;color:#111827}
+  a{color:#1d4ed8}
   h1{margin:.9rem 0 .35rem;font-size:clamp(1.45rem,6vw,2rem);line-height:1.1}
   nav{position:sticky;top:0;z-index:10;display:flex;gap:.45rem;overflow-x:auto;padding:.65rem .2rem .7rem;margin:-1rem -1rem .8rem;background:rgba(247,248,251,.96);backdrop-filter:blur(8px);border-bottom:1px solid #e5e7eb}
   nav a{flex:0 0 auto;display:inline-flex;align-items:center;min-height:38px;padding:.45rem .7rem;border:1px solid #dbe1ea;border-radius:999px;background:#fff;color:#111827;text-decoration:none;font-size:14px;font-weight:650;box-shadow:0 1px 2px rgba(16,24,40,.04)}
@@ -785,6 +786,18 @@ function adminPageShell(title, bodyHtml) {
   .ok{color:#117a3a;font-weight:600}
   .bad{color:#a00;font-weight:600}
   .pill{display:inline-block;padding:1px 6px;border-radius:8px;background:#eef;font-size:12px}
+  .card{background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:.85rem;margin:.75rem 0;box-shadow:0 1px 3px rgba(16,24,40,.08)}
+  .actions{display:flex;gap:.5rem;flex-wrap:wrap;margin:.75rem 0}
+  .button{display:inline-flex;align-items:center;min-height:38px;padding:.45rem .75rem;border:1px solid #dbe1ea;border-radius:10px;background:#fff;color:#111827;text-decoration:none;font-weight:650}
+  .thread{display:flex;flex-direction:column;gap:.65rem;margin:1rem 0}
+  .bubble{max-width:min(92%,720px);padding:.75rem .85rem;border-radius:16px;border:1px solid #e5e7eb;box-shadow:0 1px 2px rgba(16,24,40,.05)}
+  .bubble.user{align-self:flex-start;background:#e8f4ff}
+  .bubble.assistant{align-self:flex-end;background:#f3f4f6}
+  .bubble.system{align-self:center;background:#fff8e1}
+  .bubble strong{display:block;margin-bottom:.35rem;font-size:12px;letter-spacing:.02em;text-transform:uppercase;color:#4b5563}
+  .bubble pre{margin:0;background:transparent;padding:0;font:inherit;white-space:pre-wrap;word-break:break-word}
+  .stack{display:grid;gap:.75rem}
+  .nowrap{white-space:nowrap}
   @media (max-width:640px){
     body{padding:.8rem;font-size:15px}
     nav{margin:-.8rem -.8rem .75rem;padding:.6rem .75rem}
@@ -793,6 +806,8 @@ function adminPageShell(title, bodyHtml) {
     th,td{padding:.65rem .55rem;font-size:13px}
     code,pre{font-size:11px}
     table{min-width:680px}
+    .button{min-height:42px}
+    .bubble{max-width:100%;border-radius:14px}
   }
 </style>
 </head><body>
@@ -1029,12 +1044,30 @@ app.post('/webhook/uchat', defaultHandler);
 const webhookGetInfoHtml = `<!DOCTYPE html>
 <html lang="hr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Webhook — samo POST</title>
-<style>body{font-family:system-ui;max-width:40rem;margin:2rem;line-height:1.5} code{background:#f0f0f0;padding:2px 6px;border-radius:4px}</style>
+<style>
+  *{box-sizing:border-box}
+  html{background:#f7f8fb}
+  body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:42rem;margin:0 auto;padding:1rem;line-height:1.55;color:#111827}
+  h1{font-size:clamp(1.6rem,7vw,2.25rem);line-height:1.1;margin:1rem 0}
+  p{margin:.85rem 0}
+  code{background:#f0f0f0;padding:2px 6px;border-radius:4px;word-break:break-word}
+  .card{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:1rem;margin:1rem 0;box-shadow:0 1px 3px rgba(16,24,40,.08)}
+  .actions{display:flex;flex-wrap:wrap;gap:.5rem;margin:1rem 0}
+  .actions a{display:inline-flex;align-items:center;min-height:42px;padding:.55rem .8rem;border:1px solid #dbe1ea;border-radius:999px;background:#fff;color:#111827;text-decoration:none;font-weight:650}
+</style>
 </head><body>
+<div class="card">
 <h1>Ovo nije greška</h1>
 <p><strong>UChat External Request šalje <code>POST</code></strong> na ovaj URL. Preglednik kad otvoriš link uvijek šalje <strong><code>GET</code></strong>, pa Express nema GET rutu za webhook — zato si prije vidio „Cannot GET”.</p>
 <p>Per-bot rute: <code>POST /webhook/uchat/esma</code>, <code>POST /webhook/uchat/sara</code>.</p>
-<p>Za test u browseru otvori: <a href="/">/</a> (health), <a href="/triggers?format=html">/triggers</a> ili <a href="/messages?format=html">/messages</a>.</p>
+<p>Za test u browseru otvori:</p>
+<div class="actions">
+  <a href="/">Health</a>
+  <a href="/admin?format=html">Dashboard</a>
+  <a href="/triggers?format=html">Triggers</a>
+  <a href="/messages?format=html">Messages</a>
+</div>
+</div>
 </body></html>`;
 app.get('/webhook', (_req, res) => res.type('html').send(webhookGetInfoHtml));
 app.get('/webhook/make', (_req, res) => res.type('html').send(webhookGetInfoHtml));
@@ -1094,16 +1127,16 @@ app.get('/triggers', (req, res) => {
 <tr><td colspan="7" style="background:#fafafa;font-size:12px"><details><summary>raw JSON</summary><pre style="white-space:pre-wrap;word-break:break-all;margin:8px 0">${raw}</pre></details></td></tr>`;
       })
       .join('\n');
-    res.type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Webhook triggers</title>
-<style>body{font-family:system-ui;margin:1rem;} table{border-collapse:collapse;width:100%} th,td{border:1px solid #ccc;padding:8px;text-align:left} th{background:#f4f4f4} code{font-size:12px}</style>
-</head><body>
-<h1>Dolazni webhookovi (trigeri)</h1>
-<p>Zadnjih ${MAX_TRIGGER_LOG} zahtjeva. <a href="/messages?format=html${tokenQ}">Threads →</a></p>
-<table><thead><tr><th>Vrijeme (UTC)</th><th>Bot</th><th>Ishod</th><th>sender_id</th><th>Tekst</th><th>Import</th><th>Napomena</th></tr></thead>
-<tbody>${rows || '<tr><td colspan="7">Još nema triggera — pošalji poruku kad je flow povezan.</td></tr>'}</tbody></table>
-<p><a href="/triggers?format=json${tokenQ}">JSON</a></p>
-</body></html>`);
+    const bodyHtml = `
+      <p class="muted">Zadnjih ${MAX_TRIGGER_LOG} zahtjeva. Ovdje vidiš webhook payload, import status i greške.</p>
+      <div class="actions">
+        <a class="button" href="/messages?format=html${tokenQ}">Threads</a>
+        <a class="button" href="/triggers?format=json${tokenQ}">JSON</a>
+      </div>
+      <table><thead><tr><th>Vrijeme (UTC)</th><th>Bot</th><th>Ishod</th><th>sender_id</th><th>Tekst</th><th>Import</th><th>Napomena</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="7">Još nema triggera - pošalji poruku kad je flow povezan.</td></tr>'}</tbody></table>
+    `;
+    res.type('html').send(adminPageShell('Dolazni Webhookovi', bodyHtml));
     return;
   }
 
@@ -1165,16 +1198,16 @@ app.get('/messages', async (req, res) => {
             `<tr><td><code>${esc(r.bot)}</code></td><td><a href="/messages/${encodeURIComponent(r.bot)}/${encodeURIComponent(r.subscriber_id)}?format=html${tokenQ}">${esc(r.subscriber_id)}</a></td><td>${r.message_count}</td><td>${esc(r.last_role || '')}</td><td>${esc(r.last_preview || '')}</td></tr>`
         )
         .join('\n');
-      res.type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Grok threads</title>
-<style>body{font-family:system-ui;margin:1rem;} table{border-collapse:collapse;width:100%} th,td{border:1px solid #ccc;padding:8px;text-align:left} th{background:#f4f4f4}</style>
-</head><body>
-<h1>${redisEnabled ? 'Redis' : 'In-memory'} threads</h1>
-<p>${VIEW_MESSAGES_TOKEN ? 'Token required.' : ''} <a href="/triggers?format=html${tokenQ}">Dolazni triggeri →</a></p>
-<table><thead><tr><th>Bot</th><th>Subscriber</th><th>Msgs</th><th>Last role</th><th>Preview</th></tr></thead>
-<tbody>${lines || '<tr><td colspan="5">No messages yet</td></tr>'}</tbody></table>
-<p><a href="/messages?format=json${tokenQ}">JSON</a></p>
-</body></html>`);
+      const bodyHtml = `
+        <p class="muted">${redisEnabled ? 'Redis-backed' : 'In-memory'} threads. ${VIEW_MESSAGES_TOKEN ? 'Token required.' : ''}</p>
+        <div class="actions">
+          <a class="button" href="/triggers?format=html${tokenQ}">Dolazni triggeri</a>
+          <a class="button" href="/messages?format=json${tokenQ}">JSON</a>
+        </div>
+        <table><thead><tr><th>Bot</th><th>Subscriber</th><th>Msgs</th><th>Last role</th><th>Preview</th></tr></thead>
+        <tbody>${lines || '<tr><td colspan="5">No messages yet</td></tr>'}</tbody></table>
+      `;
+      res.type('html').send(adminPageShell(`${redisEnabled ? 'Redis' : 'In-memory'} Threads`, bodyHtml));
       return;
     }
 
@@ -1220,17 +1253,21 @@ async function renderThread(req, res, botId, subscriberId) {
     const blocks = view
       .map(
         (m) =>
-          `<div style="margin:12px 0;padding:12px;border-radius:8px;background:${m.role === 'user' ? '#e8f4ff' : m.role === 'assistant' ? '#f0f0f0' : '#fff8e1'}"><strong>${esc(m.role)}</strong><pre style="white-space:pre-wrap;margin:8px 0 0;font:inherit">${esc(m.content)}</pre></div>`
+          `<div class="bubble ${esc(m.role)}"><strong>${esc(m.role)}</strong><pre>${esc(m.content)}</pre></div>`
       )
       .join('\n');
-    res.type('html').send(`<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Thread ${esc(bot.id)}/${esc(subscriberId)}</title>
-<style>body{font-family:system-ui;margin:1rem;max-width:720px}</style>
-</head><body>
-<p><a href="/messages?format=html${tokenQ}">← All threads</a></p>
-<h1>${esc(bot.displayName)} · ${esc(subscriberId)}</h1>
-${blocks}
-</body></html>`);
+    const bodyHtml = `
+      <div class="actions">
+        <a class="button" href="/messages?format=html${tokenQ}">All threads</a>
+        <a class="button" href="/conversations?format=html&bot=${encodeURIComponent(bot.id)}${tokenQ}">${esc(bot.displayName)} conversations</a>
+      </div>
+      <div class="card">
+        <div class="muted">Subscriber</div>
+        <code>${esc(subscriberId)}</code>
+      </div>
+      <div class="thread">${blocks}</div>
+    `;
+    res.type('html').send(adminPageShell(`${esc(bot.displayName)} Thread`, bodyHtml));
     return;
   }
 
