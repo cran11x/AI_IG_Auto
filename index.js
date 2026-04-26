@@ -148,6 +148,18 @@ function isInvalidUchatUserNsError(detail) {
     .some((v) => v.includes('user ns format is invalid'));
 }
 
+function isKnownTestSubscriberId(subscriberId) {
+  const id = String(subscriberId || '').trim().toLowerCase();
+  if (!id) return true;
+  if (id.includes('{{') || id.includes('}}')) return true;
+  return (
+    /^render_(esma|sara)_test_\d+$/.test(id) ||
+    /^local_.*_test$/.test(id) ||
+    /^test_(esma|sara)_/.test(id) ||
+    /_test_\d+$/.test(id)
+  );
+}
+
 function countUserMessages(messages) {
   if (!Array.isArray(messages)) return 0;
   return messages.filter((m) => m.role === 'user').length;
@@ -297,6 +309,19 @@ async function flushPending(botId, subscriberId) {
 
   const pendingRaw = await loadPending(botId, subscriberId);
   if (!pendingRaw || pendingRaw.dueAt > Date.now()) return;
+  if (isKnownTestSubscriberId(subscriberId)) {
+    await clearPending(botId, subscriberId);
+    pushTrigger({
+      id: `${Date.now()}-discard-${Math.random().toString(36).slice(2, 9)}`,
+      at: new Date().toISOString(),
+      outcome: 'discarded',
+      reason: 'test_subscriber_id',
+      bot: bot.id,
+      subscriber_id: subscriberId
+    });
+    console.warn(`🧹 [${bot.id}/${subscriberId}] Cleared test pending message before calling Grok/UChat`);
+    return;
+  }
 
   const msgsBefore = await loadConversation(botId, subscriberId);
   if (!Array.isArray(msgsBefore) || msgsBefore.length === 0) {
