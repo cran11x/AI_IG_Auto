@@ -126,6 +126,19 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function formatDelay(ms) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  const parts = [];
+  if (hours) parts.push(`${hours}h`);
+  if (minutes) parts.push(`${minutes}m`);
+  if (!hours && !minutes) parts.push(`${seconds}s`);
+  return parts.join(' ');
+}
+
 function countUserMessages(messages) {
   if (!Array.isArray(messages)) return 0;
   return messages.filter((m) => m.role === 'user').length;
@@ -591,6 +604,10 @@ function makeWebhookHandler(botId) {
         igUsername,
         path: req.path
       });
+      const waitMs = dueAt - Date.now();
+      console.log(
+        `⏱️  [${bot.id}/${subscriberId}] Reply scheduled in ${formatDelay(waitMs)} (at ${new Date(dueAt).toISOString()})`
+      );
 
       pushTrigger({
         id: triggerId,
