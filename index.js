@@ -46,6 +46,7 @@ const { withTimeAwareMessages } = require('./prompts/timeContext');
 // ── Conversation store (Redis primary; in-memory fallback) ───────────────────
 // In-memory maps su keyani po `${botId}:${subscriberId}` da Esma i Sara nemaju zajedničku istoriju.
 const conversations = new Map();
+const subscriberMetaStore = new Map();
 const redisClient = REDIS_URL ? createClient({ url: REDIS_URL }) : null;
 let redisEnabled = false;
 
@@ -74,6 +75,8 @@ const memKey = (botId, subscriberId) => `${botId}:${subscriberId}`;
 const conversationKey = (botId, subscriberId) =>
   `${REDIS_KEY_PREFIX}:${botId}:conversation:${subscriberId}`;
 const conversationIndexKey = (botId) => `${REDIS_KEY_PREFIX}:${botId}:conversations`;
+const subscriberMetaKey = (botId, subscriberId) =>
+  `${REDIS_KEY_PREFIX}:${botId}:subscriberMeta:${subscriberId}`;
 
 async function loadConversation(botId, subscriberId) {
   if (redisEnabled) {
@@ -109,6 +112,44 @@ async function listConversationIds(botId) {
   return [...conversations.keys()]
     .filter((k) => k.startsWith(prefix))
     .map((k) => k.slice(prefix.length));
+}
+
+async function loadSubscriberMeta(botId, subscriberId) {
+  if (redisEnabled) {
+    const raw = await redisClient.get(subscriberMetaKey(botId, subscriberId));
+    if (!raw) return {};
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return subscriberMetaStore.get(memKey(botId, subscriberId)) || {};
+}
+
+function compactSubscriberMeta(meta) {
+  const clean = {};
+  if (meta.firstName) clean.firstName = String(meta.firstName).trim();
+  if (meta.igUsername) clean.igUsername = String(meta.igUsername).replace(/^@/, '').trim();
+  if (meta.imageUrl) clean.imageUrl = String(meta.imageUrl).trim();
+  return Object.fromEntries(Object.entries(clean).filter(([, v]) => v));
+}
+
+async function saveSubscriberMeta(botId, subscriberId, meta) {
+  const clean = compactSubscriberMeta(meta || {});
+  if (!Object.keys(clean).length) return;
+  const existing = await loadSubscriberMeta(botId, subscriberId);
+  const next = {
+    ...existing,
+    ...clean,
+    updated_at: new Date().toISOString()
+  };
+  if (redisEnabled) {
+    await redisClient.set(subscriberMetaKey(botId, subscriberId), JSON.stringify(next));
+    return;
+  }
+  subscriberMetaStore.set(memKey(botId, subscriberId), next);
 }
 
 // ── Pending flush (debounce user message clusters) ───────────────────────────
@@ -639,7 +680,7 @@ function trimHistory(messages) {
 // Pull subscriber id + last user text from Make.com or UChat payload shapes
 function extractWebhookFields(body) {
   // Očekujemo strukturu npr: { "sender_id": "123", "text": "Bok", "name": "Dani" }
-  // Ili za UChat: { "user_ns": "...", "text": "...", "name": "...", "username": "..." }
+  // Ili za UChat: { "user_ns": "...", "text": "...", "name": "...", "username": "...", "image": "..." }
 
   const pickFirstNonEmpty = (...vals) => {
     for (const v of vals) {
@@ -702,14 +743,43 @@ function extractWebhookFields(body) {
     userText = reaction ? `story reaction ${reaction}` : 'replied to your story';
   }
 
-  const firstName = body.name || body.first_name;
-  const igUsername = body.username || body.ig_username;
+  const firstName = pickFirstNonEmpty(body.name, body.first_name, body.full_name, body.subscriber?.name);
+  const igUsername = pickFirstNonEmpty(
+    body.username,
+    body.ig_username,
+    body.instagram_username,
+    body.user_name,
+    body.subscriber?.username,
+    body.contact?.username
+  );
+  const imageUrl = pickFirstNonEmpty(
+    body.image,
+    body.profile_pic,
+    body.profile_pic_url,
+    body.profile_picture,
+    body.profile_picture_url,
+    body.avatar,
+    body.avatar_url,
+    body.picture,
+    body.picture_url,
+    body.photo,
+    body.photo_url,
+    body.ig_profile_pic,
+    body.payload?.image,
+    body.payload?.profile_pic,
+    body.subscriber?.image,
+    body.subscriber?.profile_pic,
+    body.subscriber?.profile_pic_url,
+    body.contact?.image,
+    body.contact?.avatar
+  );
 
   return {
     subscriberId: subscriberId != null ? String(subscriberId) : undefined,
     userText: userText != null ? String(userText).trim() : undefined,
     firstName: firstName || undefined,
-    igUsername: igUsername || undefined
+    igUsername: igUsername || undefined,
+    imageUrl: imageUrl || undefined
   };
 }
 
@@ -761,6 +831,24 @@ function wantsHtmlResponse(req) {
   );
 }
 
+function subscriberDisplayName(meta, fallbackId) {
+  if (meta?.firstName) return meta.firstName;
+  if (meta?.igUsername) return `@${meta.igUsername}`;
+  return fallbackId;
+}
+
+function renderSubscriberCell(meta, subscriberId) {
+  const cleanMeta = meta || {};
+  const username = cleanMeta.igUsername ? `@${cleanMeta.igUsername}` : '';
+  const title = subscriberDisplayName(cleanMeta, subscriberId);
+  const sub = [username, subscriberId].filter(Boolean).join(' · ');
+  const initial = String(title || subscriberId || '?').trim().charAt(0).toUpperCase() || '?';
+  const avatar = cleanMeta.imageUrl
+    ? `<img class="avatar" src="${escHtml(cleanMeta.imageUrl)}" alt="${escHtml(title)}">`
+    : `<span class="avatar placeholder">${escHtml(initial)}</span>`;
+  return `<div class="subscriber">${avatar}<div><div class="subscriber-main">${escHtml(title)}</div><div class="subscriber-sub">${escHtml(sub)}</div></div></div>`;
+}
+
 function adminPageShell(title, bodyHtml) {
   const tokenQ = tokenQuerySuffix();
   return `<!DOCTYPE html>
@@ -786,6 +874,11 @@ function adminPageShell(title, bodyHtml) {
   .ok{color:#117a3a;font-weight:600}
   .bad{color:#a00;font-weight:600}
   .pill{display:inline-block;padding:1px 6px;border-radius:8px;background:#eef;font-size:12px}
+  .subscriber{display:flex;align-items:center;gap:.6rem;min-width:190px}
+  .avatar{width:38px;height:38px;border-radius:999px;object-fit:cover;border:1px solid #dbe1ea;background:#eef;flex:0 0 auto}
+  .avatar.placeholder{display:inline-flex;align-items:center;justify-content:center;font-weight:750;color:#475569}
+  .subscriber-main{font-weight:700}
+  .subscriber-sub{color:#666;font-size:12px;margin-top:1px}
   .card{background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:.85rem;margin:.75rem 0;box-shadow:0 1px 3px rgba(16,24,40,.08)}
   .actions{display:flex;gap:.5rem;flex-wrap:wrap;margin:.75rem 0}
   .button{display:inline-flex;align-items:center;min-height:38px;padding:.45rem .75rem;border:1px solid #dbe1ea;border-radius:10px;background:#fff;color:#111827;text-decoration:none;font-weight:650}
@@ -808,6 +901,7 @@ function adminPageShell(title, bodyHtml) {
     table{min-width:680px}
     .button{min-height:42px}
     .bubble{max-width:100%;border-radius:14px}
+    .avatar{width:34px;height:34px}
   }
 </style>
 </head><body>
@@ -852,14 +946,17 @@ async function collectAllConversations(filterBotId) {
   const rows = [];
   for (const botId of botsToList) {
     const ids = await listConversationIds(botId);
-    const tuples = await Promise.all(ids.map(async (id) => [id, await loadConversation(botId, id)]));
-    for (const [id, msgs] of tuples) {
+    const tuples = await Promise.all(
+      ids.map(async (id) => [id, await loadConversation(botId, id), await loadSubscriberMeta(botId, id)])
+    );
+    for (const [id, msgs, meta] of tuples) {
       if (!Array.isArray(msgs)) continue;
       const nonSys = msgs.filter((m) => m.role !== 'system');
       const last = nonSys[nonSys.length - 1];
       rows.push({
         bot: botId,
         subscriber_id: id,
+        meta,
         message_count: nonSys.length,
         last_role: last?.role || null,
         last_preview: last?.content ? String(last.content).slice(0, 120) : null
@@ -877,16 +974,26 @@ async function collectAllPending(filterBotId) {
   const rows = [];
   for (const botId of botsToList) {
     const ids = await listPendingIds(botId);
-    const tuples = await Promise.all(ids.map(async (id) => [id, await loadPending(botId, id)]));
-    for (const [id, payload] of tuples) {
+    const tuples = await Promise.all(
+      ids.map(async (id) => [id, await loadPending(botId, id), await loadSubscriberMeta(botId, id)])
+    );
+    for (const [id, payload, meta] of tuples) {
       if (!payload || typeof payload !== 'object') continue;
       const dueAt = Number(payload.dueAt) || 0;
       const remainingMs = dueAt - now;
+      const mergedMeta = {
+        ...meta,
+        firstName: payload.firstName || meta.firstName,
+        igUsername: payload.igUsername || meta.igUsername,
+        imageUrl: payload.imageUrl || meta.imageUrl
+      };
       rows.push({
         bot: botId,
         subscriber_id: id,
-        first_name: payload.firstName || null,
-        ig_username: payload.igUsername || null,
+        meta: mergedMeta,
+        first_name: mergedMeta.firstName || null,
+        ig_username: mergedMeta.igUsername || null,
+        image_url: mergedMeta.imageUrl || null,
         path: payload.path || null,
         due_at: dueAt ? new Date(dueAt).toISOString() : null,
         wait_remaining_ms: remainingMs,
@@ -932,7 +1039,7 @@ function makeWebhookHandler(botId) {
         });
       }
 
-      const { subscriberId, userText, firstName, igUsername } = extractWebhookFields(body);
+      const { subscriberId, userText, firstName, igUsername, imageUrl } = extractWebhookFields(body);
 
       if (!GROK_API_KEY) {
         console.error('❌ GROK_API_KEY missing');
@@ -951,6 +1058,7 @@ function makeWebhookHandler(botId) {
           subscriber_id: subscriberId ?? null,
           first_name: firstName ?? null,
           ig_username: igUsername ?? null,
+          image_url: imageUrl ?? null,
           user_text: userText ?? null,
           raw_json: rawJsonPreview(body)
         });
@@ -961,6 +1069,7 @@ function makeWebhookHandler(botId) {
       }
 
       console.log(`👤 [${bot.id}/${subscriberId}] User says: "${userText}"`);
+      await saveSubscriberMeta(bot.id, subscriberId, { firstName, igUsername, imageUrl });
 
       const { messages, importStatus } = await getHistory(
         bot.id,
@@ -976,6 +1085,7 @@ function makeWebhookHandler(botId) {
       const dueAt = await schedulePending(bot.id, subscriberId, {
         firstName,
         igUsername,
+        imageUrl,
         path: req.path
       });
       const waitMs = dueAt - Date.now();
@@ -991,6 +1101,7 @@ function makeWebhookHandler(botId) {
         subscriber_id: subscriberId,
         first_name: firstName ?? null,
         ig_username: igUsername ?? null,
+        image_url: imageUrl ?? null,
         user_text: userText,
         scheduled_for: new Date(dueAt).toISOString(),
         import_status: importStatus || null,
@@ -1007,7 +1118,7 @@ function makeWebhookHandler(botId) {
       const detail = err.response?.data || err.message;
       console.error('❌ Webhook error:', detail);
       const body = req.body;
-      const { subscriberId, userText, firstName, igUsername } = extractWebhookFields(body || {});
+      const { subscriberId, userText, firstName, igUsername, imageUrl } = extractWebhookFields(body || {});
       pushTrigger({
         id: triggerId,
         at: new Date().toISOString(),
@@ -1016,6 +1127,7 @@ function makeWebhookHandler(botId) {
         subscriber_id: subscriberId ?? null,
         first_name: firstName ?? null,
         ig_username: igUsername ?? null,
+        image_url: imageUrl ?? null,
         user_text: userText ?? null,
         error: typeof detail === 'string' ? detail.slice(0, 500) : rawJsonPreview(detail, 800),
         raw_json: rawJsonPreview(body || {})
@@ -1118,10 +1230,14 @@ app.get('/triggers', (req, res) => {
     const rows = triggerLog
       .map((t) => {
         const raw = esc(t.raw_json || '');
-        const namePart = [t.first_name, t.ig_username ? `@${t.ig_username}` : ''].filter(Boolean).join(' ');
+        const meta = {
+          firstName: t.first_name,
+          igUsername: t.ig_username,
+          imageUrl: t.image_url
+        };
         return `<tr><td style="white-space:nowrap">${esc(t.at)}</td><td><code>${esc(
           t.bot || ''
-        )}</code></td><td><code>${esc(t.outcome)}</code></td><td>${esc(t.subscriber_id ?? '')}<br><small style="color:#666">${esc(namePart)}</small></td><td>${esc(
+        )}</code></td><td><code>${esc(t.outcome)}</code></td><td>${renderSubscriberCell(meta, t.subscriber_id ?? '')}</td><td>${esc(
           (t.user_text || '').slice(0, 120)
         )}</td><td>${esc(formatImport(t.import_status))}</td><td>${esc(t.reason || t.error || t.reply_preview || '')}</td></tr>
 <tr><td colspan="7" style="background:#fafafa;font-size:12px"><details><summary>raw JSON</summary><pre style="white-space:pre-wrap;word-break:break-all;margin:8px 0">${raw}</pre></details></td></tr>`;
@@ -1168,14 +1284,17 @@ app.get('/messages', async (req, res) => {
     for (const botId of botsToList) {
       if (!getBot(botId)) continue;
       const ids = await listConversationIds(botId);
-      const tuples = await Promise.all(ids.map(async (id) => [id, await loadConversation(botId, id)]));
-      for (const [id, msgs] of tuples) {
+      const tuples = await Promise.all(
+        ids.map(async (id) => [id, await loadConversation(botId, id), await loadSubscriberMeta(botId, id)])
+      );
+      for (const [id, msgs, meta] of tuples) {
         if (!Array.isArray(msgs)) continue;
         const nonSys = msgs.filter((m) => m.role !== 'system');
         const last = nonSys[nonSys.length - 1];
         rows.push({
           bot: botId,
           subscriber_id: id,
+          meta,
           message_count: nonSys.length,
           last_role: last?.role,
           last_preview: last?.content ? String(last.content).slice(0, 120) : null
@@ -1195,7 +1314,7 @@ app.get('/messages', async (req, res) => {
       const lines = rows
         .map(
           (r) =>
-            `<tr><td><code>${esc(r.bot)}</code></td><td><a href="/messages/${encodeURIComponent(r.bot)}/${encodeURIComponent(r.subscriber_id)}?format=html${tokenQ}">${esc(r.subscriber_id)}</a></td><td>${r.message_count}</td><td>${esc(r.last_role || '')}</td><td>${esc(r.last_preview || '')}</td></tr>`
+            `<tr><td><code>${esc(r.bot)}</code></td><td>${renderSubscriberCell(r.meta, r.subscriber_id)}<a class="muted" href="/messages/${encodeURIComponent(r.bot)}/${encodeURIComponent(r.subscriber_id)}?format=html${tokenQ}">open thread</a></td><td>${r.message_count}</td><td>${esc(r.last_role || '')}</td><td>${esc(r.last_preview || '')}</td></tr>`
         )
         .join('\n');
       const bodyHtml = `
@@ -1204,7 +1323,7 @@ app.get('/messages', async (req, res) => {
           <a class="button" href="/triggers?format=html${tokenQ}">Dolazni triggeri</a>
           <a class="button" href="/messages?format=json${tokenQ}">JSON</a>
         </div>
-        <table><thead><tr><th>Bot</th><th>Subscriber</th><th>Msgs</th><th>Last role</th><th>Preview</th></tr></thead>
+        <table><thead><tr><th>Bot</th><th>User</th><th>Msgs</th><th>Last role</th><th>Preview</th></tr></thead>
         <tbody>${lines || '<tr><td colspan="5">No messages yet</td></tr>'}</tbody></table>
       `;
       res.type('html').send(adminPageShell(`${redisEnabled ? 'Redis' : 'In-memory'} Threads`, bodyHtml));
@@ -1240,6 +1359,7 @@ async function renderThread(req, res, botId, subscriberId) {
       req.headers.accept.includes('text/html'));
 
   const view = redactMessagesForView(msgs);
+  const meta = await loadSubscriberMeta(bot.id, subscriberId);
 
   if (wantsHtml) {
     const esc = (s) =>
@@ -1262,8 +1382,7 @@ async function renderThread(req, res, botId, subscriberId) {
         <a class="button" href="/conversations?format=html&bot=${encodeURIComponent(bot.id)}${tokenQ}">${esc(bot.displayName)} conversations</a>
       </div>
       <div class="card">
-        <div class="muted">Subscriber</div>
-        <code>${esc(subscriberId)}</code>
+        ${renderSubscriberCell(meta, subscriberId)}
       </div>
       <div class="thread">${blocks}</div>
     `;
@@ -1391,7 +1510,7 @@ app.get('/conversations', async (req, res) => {
       const detailHref = `/messages/${encodeURIComponent(r.bot)}/${encodeURIComponent(r.subscriber_id)}?format=html${tokenQ}`;
       return `<tr>
         <td><span class="pill">${escHtml(r.bot)}</span></td>
-        <td><code>${escHtml(r.subscriber_id)}</code></td>
+        <td>${renderSubscriberCell(r.meta, r.subscriber_id)}</td>
         <td>${r.message_count}</td>
         <td>${escHtml(r.last_role || '—')}</td>
         <td>${escHtml(r.last_preview || '')}</td>
@@ -1404,7 +1523,7 @@ app.get('/conversations', async (req, res) => {
     <p class="muted">${filterBot ? `Filtered by bot: <code>${escHtml(filterBot)}</code>. ` : ''}Conversation history is preserved across prompt/code changes.</p>
     <table>
       <thead><tr>
-        <th>Bot</th><th>Subscriber</th><th>Messages</th><th>Last role</th><th>Last preview</th><th></th>
+        <th>Bot</th><th>User</th><th>Messages</th><th>Last role</th><th>Last preview</th><th></th>
       </tr></thead>
       <tbody>${trs || '<tr><td colspan="6" class="muted">No conversations yet.</td></tr>'}</tbody>
     </table>
@@ -1435,7 +1554,7 @@ app.get('/pending', async (req, res) => {
       return `<tr>
         <td><span class="pill">${escHtml(r.bot)}</span></td>
         <td><code>${escHtml(r.subscriber_id)}</code></td>
-        <td>${escHtml(r.first_name || '')}${r.ig_username ? ` <span class="muted">@${escHtml(r.ig_username)}</span>` : ''}</td>
+        <td>${renderSubscriberCell(r.meta, r.subscriber_id)}</td>
         <td>${escHtml(r.path || '')}</td>
         <td>${wait}</td>
         <td><pre>${escHtml(curlCmd)}</pre></td>
@@ -1476,11 +1595,16 @@ app.get('/history-imports', (req, res) => {
           .map((m) => `<div style="margin:6px 0"><span class="pill">${escHtml(m.role || '')}</span> ${escHtml(m.content || '')}</div>`)
           .join('')
         : '<span class="muted">No imported message preview recorded.</span>';
+      const meta = {
+        firstName: t.first_name,
+        igUsername: t.ig_username,
+        imageUrl: t.image_url
+      };
       const detailHref = `/messages/${encodeURIComponent(t.bot || DEFAULT_BOT_ID)}/${encodeURIComponent(t.subscriber_id || '')}?format=html${tokenQ}`;
       return `<tr>
         <td>${escHtml(t.at || '')}</td>
         <td><span class="pill">${escHtml(t.bot || '')}</span></td>
-        <td><code>${escHtml(t.subscriber_id || '')}</code><br><small class="muted">${escHtml(t.ig_username ? `@${t.ig_username}` : t.first_name || '')}</small></td>
+        <td>${renderSubscriberCell(meta, t.subscriber_id || '')}</td>
         <td>${escHtml(status.status || '')}</td>
         <td>${escHtml(status.count ?? 0)} / raw ${escHtml(status.raw_count ?? '')}</td>
         <td>${previewHtml}</td>
