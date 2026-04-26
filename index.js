@@ -139,6 +139,15 @@ function formatDelay(ms) {
   return parts.join(' ');
 }
 
+function isInvalidUchatUserNsError(detail) {
+  if (!detail) return false;
+  const message = typeof detail === 'string' ? detail : detail.message || detail.error || '';
+  const userNsErrors = Array.isArray(detail.errors?.user_ns) ? detail.errors.user_ns : [];
+  return [message, ...userNsErrors]
+    .map((v) => String(v).toLowerCase())
+    .some((v) => v.includes('user ns format is invalid'));
+}
+
 function countUserMessages(messages) {
   if (!Array.isArray(messages)) return 0;
   return messages.filter((m) => m.role === 'user').length;
@@ -385,6 +394,19 @@ async function flushPending(botId, subscriberId) {
   } catch (err) {
     const detail = err.response?.data || err.message;
     console.error(`❌ Flush failed [${bot.id}/${subscriberId}]:`, detail);
+    if (isInvalidUchatUserNsError(detail)) {
+      await clearPending(bot.id, subscriberId);
+      pushTrigger({
+        id: `${Date.now()}-discard-${Math.random().toString(36).slice(2, 9)}`,
+        at: new Date().toISOString(),
+        outcome: 'discarded',
+        reason: 'invalid_user_ns',
+        bot: bot.id,
+        subscriber_id: subscriberId,
+        error: typeof detail === 'string' ? detail.slice(0, 500) : rawJsonPreview(detail, 800)
+      });
+      console.warn(`🧹 [${bot.id}/${subscriberId}] Cleared pending message because UChat rejected user_ns`);
+    }
   } finally {
     await releaseFlushLock(botId, subscriberId);
   }
