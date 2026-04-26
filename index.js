@@ -268,7 +268,15 @@ async function bootstrapHistoryForNewConversation(bot, subscriberId, customPromp
     trimHistory(merged);
     return {
       messages: merged,
-      importStatus: { status: 'imported', count: normalized.length, raw_count: raw.length }
+      importStatus: {
+        status: 'imported',
+        count: normalized.length,
+        raw_count: raw.length,
+        preview: normalized.map((m) => ({
+          role: m.role,
+          content: String(m.content || '').slice(0, 500)
+        }))
+      }
     };
   } catch (err) {
     const detail = err.response?.data || err.message;
@@ -778,6 +786,7 @@ function adminPageShell(title, bodyHtml) {
   <a href="/bots?format=html${tokenQ}">Bots</a>
   <a href="/conversations?format=html${tokenQ}">Conversations</a>
   <a href="/pending?format=html${tokenQ}">Pending</a>
+  <a href="/history-imports?format=html${tokenQ}">History Imports</a>
   <a href="/failed?format=html${tokenQ}">Failed</a>
   <a href="/messages?format=html${tokenQ}">Messages</a>
   <a href="/triggers?format=html${tokenQ}">Triggers</a>
@@ -863,6 +872,10 @@ const FAILED_OUTCOMES = new Set(['error', 'skipped', 'discarded', 'wrong_path'])
 
 function collectFailedTriggers() {
   return triggerLog.filter((t) => FAILED_OUTCOMES.has(t.outcome));
+}
+
+function collectHistoryImports() {
+  return triggerLog.filter((t) => t.import_status);
 }
 
 // ── Webhook handler factory (per-bot route → shared logic) ───────────────────
@@ -1238,6 +1251,7 @@ app.get('/admin', async (req, res) => {
     collectAllConversations()
   ]);
   const failed = collectFailedTriggers();
+  const imports = collectHistoryImports();
 
   if (!wantsHtmlResponse(req)) {
     return res.json({
@@ -1246,12 +1260,14 @@ app.get('/admin', async (req, res) => {
         bot_count: bots.length,
         conversation_count: conversations.length,
         pending_count: pending.length,
+        history_import_count: imports.length,
         failed_recent: failed.length
       },
       links: {
         bots: `/bots${tokenFirst}`,
         conversations: `/conversations${tokenFirst}`,
         pending: `/pending${tokenFirst}`,
+        history_imports: `/history-imports${tokenFirst}`,
         failed: `/failed${tokenFirst}`,
         messages: `/messages${tokenFirst}`,
         triggers: `/triggers${tokenFirst}`
@@ -1267,6 +1283,7 @@ app.get('/admin', async (req, res) => {
         <tr><td>Bots</td><td>${bots.length}</td><td><a href="/bots?format=html${tokenQ}">/bots</a></td></tr>
         <tr><td>Conversations</td><td>${conversations.length}</td><td><a href="/conversations?format=html${tokenQ}">/conversations</a></td></tr>
         <tr><td>Pending replies</td><td>${pending.length}</td><td><a href="/pending?format=html${tokenQ}">/pending</a></td></tr>
+        <tr><td>History imports</td><td>${imports.length}</td><td><a href="/history-imports?format=html${tokenQ}">/history-imports</a></td></tr>
         <tr><td>Failed / discarded (recent)</td><td>${failed.length}</td><td><a href="/failed?format=html${tokenQ}">/failed</a></td></tr>
       </tbody>
     </table>
@@ -1384,6 +1401,52 @@ app.get('/pending', async (req, res) => {
     </table>
   `;
   res.type('html').send(adminPageShell('Pending', body));
+});
+
+app.get('/history-imports', (req, res) => {
+  if (!assertViewMessagesAuth(req, res)) return;
+  const items = collectHistoryImports();
+  if (!wantsHtmlResponse(req)) {
+    return res.json({
+      count: items.length,
+      note: 'Recent in-memory import events only. Restart clears this view; imported messages remain in Redis conversations.',
+      imports: items.map(({ raw_json, ...rest }) => rest)
+    });
+  }
+
+  const tokenQ = tokenQuerySuffix();
+  const trs = items
+    .map((t) => {
+      const status = t.import_status || {};
+      const preview = Array.isArray(status.preview) ? status.preview : [];
+      const previewHtml = preview.length
+        ? preview
+          .map((m) => `<div style="margin:6px 0"><span class="pill">${escHtml(m.role || '')}</span> ${escHtml(m.content || '')}</div>`)
+          .join('')
+        : '<span class="muted">No imported message preview recorded.</span>';
+      const detailHref = `/messages/${encodeURIComponent(t.bot || DEFAULT_BOT_ID)}/${encodeURIComponent(t.subscriber_id || '')}?format=html${tokenQ}`;
+      return `<tr>
+        <td>${escHtml(t.at || '')}</td>
+        <td><span class="pill">${escHtml(t.bot || '')}</span></td>
+        <td><code>${escHtml(t.subscriber_id || '')}</code><br><small class="muted">${escHtml(t.ig_username ? `@${t.ig_username}` : t.first_name || '')}</small></td>
+        <td>${escHtml(status.status || '')}</td>
+        <td>${escHtml(status.count ?? 0)} / raw ${escHtml(status.raw_count ?? '')}</td>
+        <td>${previewHtml}</td>
+        <td><a href="${detailHref}">thread</a></td>
+      </tr>`;
+    })
+    .join('');
+
+  const body = `
+    <p class="muted">Recent UChat history bootstrap attempts. This dashboard list is in-memory only; imported messages are saved in Redis and visible in each thread.</p>
+    <table>
+      <thead><tr>
+        <th>At</th><th>Bot</th><th>Subscriber</th><th>Status</th><th>Imported</th><th>Extracted preview</th><th></th>
+      </tr></thead>
+      <tbody>${trs || '<tr><td colspan="7" class="muted">No history imports recorded yet. A new subscriber must message first.</td></tr>'}</tbody>
+    </table>
+  `;
+  res.type('html').send(adminPageShell('History Imports', body));
 });
 
 app.get('/failed', (req, res) => {
