@@ -5,6 +5,7 @@ const { createClient } = require('redis');
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 
 // ── Config ──────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -41,7 +42,10 @@ const MAX_HISTORY = 20;
 
 // ── Bot config (Esma, Sara, …) ──────────────────────────────────────────────
 const { BOTS, DEFAULT_BOT_ID, getBot, listBotIds } = require('./prompts/bots');
+const { variants } = require('./prompts/variants');
 const { withTimeAwareMessages } = require('./prompts/timeContext');
+const { createPromptLab } = require('./promptLab');
+let promptLab = null;
 
 // ── Conversation store (Redis primary; in-memory fallback) ───────────────────
 // In-memory maps su keyani po `${botId}:${subscriberId}` da Esma i Sara nemaju zajedničku istoriju.
@@ -150,6 +154,53 @@ async function saveSubscriberMeta(botId, subscriberId, meta) {
     return;
   }
   subscriberMetaStore.set(memKey(botId, subscriberId), next);
+}
+
+async function getEffectivePromptBody(bot) {
+  if (!bot) return '';
+  if (promptLab?.getEffectivePrompt) {
+    const body = await promptLab.getEffectivePrompt(bot.id);
+    if (body) return body;
+  }
+  return bot.prompt;
+}
+
+function extractExistingNameLine(messages) {
+  const system = Array.isArray(messages) && messages[0]?.role === 'system'
+    ? String(messages[0].content || '')
+    : '';
+  const match = system.match(/(?:^|\n)(You are currently talking to: .+)$/m);
+  return match ? match[1].trim() : '';
+}
+
+function buildNameLine(firstName, igUsername, existingMessages) {
+  const namePart = [firstName, igUsername ? `(@${String(igUsername).replace(/^@/, '')})` : '']
+    .filter(Boolean)
+    .join(' ');
+  if (namePart) return `You are currently talking to: ${namePart}.`;
+  return extractExistingNameLine(existingMessages);
+}
+
+async function buildSystemPrompt(bot, firstName, igUsername, existingMessages) {
+  const promptBody = await getEffectivePromptBody(bot);
+  const nameLine = buildNameLine(firstName, igUsername, existingMessages);
+  return nameLine ? `${promptBody}\n${nameLine}` : promptBody;
+}
+
+async function syncConversationSystemPrompt(bot, subscriberId, messages) {
+  if (!Array.isArray(messages) || !bot) return messages;
+  const meta = await loadSubscriberMeta(bot.id, subscriberId);
+  const systemPrompt = await buildSystemPrompt(bot, meta.firstName, meta.igUsername, messages);
+  if (messages[0]?.role === 'system') {
+    if (messages[0].content !== systemPrompt) {
+      messages[0] = { ...messages[0], content: systemPrompt };
+      await saveConversation(bot.id, subscriberId, messages);
+    }
+  } else {
+    messages.unshift({ role: 'system', content: systemPrompt });
+    await saveConversation(bot.id, subscriberId, messages);
+  }
+  return messages;
 }
 
 // ── Pending flush (debounce user message clusters) ───────────────────────────
@@ -514,7 +565,11 @@ async function flushPending(botId, subscriberId) {
     const pendingAgain = await loadPending(botId, subscriberId);
     if (!pendingAgain || pendingAgain.dueAt > Date.now()) return;
 
-    const messagesForGrok = await loadConversation(botId, subscriberId);
+    const messagesForGrok = await syncConversationSystemPrompt(
+      bot,
+      subscriberId,
+      await loadConversation(botId, subscriberId)
+    );
     if (countUserMessages(messagesForGrok) !== userSnap) return;
 
     const grokMessages = withTimeAwareMessages(messagesForGrok, bot.timezone);
@@ -641,11 +696,7 @@ async function getHistory(botId, subscriberId, firstName, igUsername, latestUser
     return { messages: existing, importStatus: null };
   }
 
-  let customPrompt = bot.prompt;
-  if (firstName || igUsername) {
-    const namePart = [firstName, igUsername ? `(@${igUsername})` : ''].filter(Boolean).join(' ');
-    customPrompt += `\nYou are currently talking to: ${namePart}.`;
-  }
+  const customPrompt = await buildSystemPrompt(bot, firstName, igUsername);
 
   const { messages, importStatus } = await bootstrapHistoryForNewConversation(
     bot,
@@ -922,6 +973,7 @@ function adminPageShell(title, bodyHtml) {
   <a href="/failed?format=html${tokenQ}">Failed</a>
   <a href="/messages?format=html${tokenQ}">Messages</a>
   <a href="/triggers?format=html${tokenQ}">Triggers</a>
+  <a href="/prompt-lab?format=html${tokenQ}">Prompt Lab</a>
 </nav>
 <h1>${escHtml(title)}</h1>
 ${bodyHtml}
@@ -1032,6 +1084,32 @@ function collectFailedTriggers() {
 function collectHistoryImports() {
   return triggerLog.filter((t) => t.import_status);
 }
+
+promptLab = createPromptLab({
+  app,
+  axios,
+  BOTS,
+  variants,
+  getBot,
+  listBotIds,
+  redisClient,
+  isRedisEnabled: () => redisEnabled,
+  REDIS_KEY_PREFIX,
+  GROK_URL,
+  GROK_MODEL,
+  GROK_API_KEY,
+  assertViewMessagesAuth,
+  wantsHtmlResponse,
+  adminPageShell,
+  escHtml,
+  renderSubscriberCell,
+  tokenQuerySuffix,
+  tokenQueryFirst,
+  loadConversation,
+  listConversationIds,
+  loadSubscriberMeta,
+  withTimeAwareMessages
+});
 
 // ── Webhook handler factory (per-bot route → shared logic) ───────────────────
 function makeWebhookHandler(botId) {
@@ -1398,6 +1476,12 @@ async function renderThread(req, res, botId, subscriberId) {
       <div class="actions">
         <a class="button" href="/messages?format=html${tokenQ}">All threads</a>
         <a class="button" href="/conversations?format=html&bot=${encodeURIComponent(bot.id)}${tokenQ}">${esc(bot.displayName)} conversations</a>
+        <form method="post" action="/prompt-lab/fixtures/from-conversation?format=html${tokenQ}" style="display:inline-flex;gap:.35rem;flex-wrap:wrap">
+          <input type="hidden" name="botId" value="${esc(bot.id)}">
+          <input type="hidden" name="subscriberId" value="${esc(subscriberId)}">
+          <input name="name" value="${esc(`${bot.displayName} ${subscriberDisplayName(meta, subscriberId)}`)}" style="min-height:38px;padding:.45rem .55rem;border:1px solid #dbe1ea;border-radius:10px">
+          <button class="button" type="submit">Save as test fixture</button>
+        </form>
       </div>
       <div class="card">
         ${renderSubscriberCell(meta, subscriberId)}
@@ -1459,7 +1543,8 @@ app.get('/admin', async (req, res) => {
         history_imports: `/history-imports${tokenFirst}`,
         failed: `/failed${tokenFirst}`,
         messages: `/messages${tokenFirst}`,
-        triggers: `/triggers${tokenFirst}`
+        triggers: `/triggers${tokenFirst}`,
+        prompt_lab: `/prompt-lab${tokenFirst}`
       }
     });
   }
@@ -1474,6 +1559,7 @@ app.get('/admin', async (req, res) => {
         <tr><td>Pending replies</td><td>${pending.length}</td><td><a href="/pending?format=html${tokenQ}">/pending</a></td></tr>
         <tr><td>History imports</td><td>${imports.length}</td><td><a href="/history-imports?format=html${tokenQ}">/history-imports</a></td></tr>
         <tr><td>Failed / discarded (recent)</td><td>${failed.length}</td><td><a href="/failed?format=html${tokenQ}">/failed</a></td></tr>
+        <tr><td>Prompt Lab</td><td>drafts / fixtures</td><td><a href="/prompt-lab?format=html${tokenQ}">/prompt-lab</a></td></tr>
       </tbody>
     </table>
     <p class="muted">Auth: ${VIEW_MESSAGES_TOKEN ? 'token required (?token= or X-View-Token)' : '<span class="bad">no token configured</span>'}</p>
@@ -1770,6 +1856,9 @@ async function startServer() {
     );
     console.log(
       `   GET  /admin?format=html      ← Admin / debug panel${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
+    );
+    console.log(
+      `   GET  /prompt-lab?format=html ← Prompt drafts + A/B tests${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
     );
     console.log(`   Tip: npm run dev:public      → Public HTTPS URL (TUNNEL=serveo|pinggy|cloudflare)\n`);
   });

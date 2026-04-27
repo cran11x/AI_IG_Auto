@@ -39,4 +39,10 @@ function listBotIds() {
   return Object.keys(BOTS);
 }
 
-module.exports = { BOTS, DEFAULT_BOT_ID, getBot, listBotIds };
+function getEffectivePrompt(botId, promptOverride) {
+  const bot = getBot(botId);
+  if (!bot) return null;
+  return promptOverride || bot.prompt;
+}
+
+module.exports = { BOTS, DEFAULT_BOT_ID, getBot, listBotIds, getEffectivePrompt };
