@@ -388,6 +388,113 @@ function countUserMessages(messages) {
   return messages.filter((m) => m.role === 'user').length;
 }
 
+function getLastAssistantMessage(messages) {
+  if (!Array.isArray(messages)) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg?.role === 'assistant' && String(msg.content || '').trim()) {
+      return { index: i, content: String(msg.content).trim() };
+    }
+  }
+  return null;
+}
+
+function normalizeDeliveryText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function getUchatMessageText(message) {
+  if (!message || typeof message !== 'object') return '';
+  if (typeof message.content === 'string' && message.content.trim()) return message.content.trim();
+  if (typeof message?.payload?.text === 'string') return message.payload.text.trim();
+  return '';
+}
+
+function looksLikeImageUrl(value) {
+  const s = String(value || '').trim();
+  if (!/^https?:\/\//i.test(s)) return false;
+  return (
+    /\.(png|jpe?g|gif|webp)(\?|#|$)/i.test(s) ||
+    /\/image\//i.test(s) ||
+    /(?:image|photo|picture|media|attachment)/i.test(s)
+  );
+}
+
+function extractFirstImageUrl(...values) {
+  if (values.length > 1) {
+    for (const item of values) {
+      const found = extractFirstImageUrl(item);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  const value = values[0];
+  if (!value) return undefined;
+  if (typeof value === 'string') return looksLikeImageUrl(value) ? value.trim() : undefined;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = extractFirstImageUrl(item);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (typeof value === 'object') {
+    const type = String(value.type || value.mime_type || value.mimetype || value.content_type || '').toLowerCase();
+    const maybeUrl = value.url || value.image_url || value.media_url || value.file_url || value.download_url || value.src;
+    if (maybeUrl && (!type || type.includes('image') || looksLikeImageUrl(maybeUrl))) {
+      const found = extractFirstImageUrl(maybeUrl);
+      if (found) return found;
+    }
+    for (const key of ['image', 'photo', 'picture', 'media', 'attachment', 'payload']) {
+      const found = extractFirstImageUrl(value[key]);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
+function isUchatOutbound(message) {
+  return String(message?.type || '').toLowerCase() !== 'in';
+}
+
+async function uchatHasAssistantText(bot, subscriberId, text, limit = 50) {
+  if (!bot?.uchatApiKey) {
+    return { delivered: false, reason: 'no_uchat_key', rawCount: 0 };
+  }
+
+  const raw = await fetchUchatChatMessages(bot, subscriberId, limit);
+  const outboundTexts = raw
+    .filter(isUchatOutbound)
+    .map(getUchatMessageText)
+    .filter(Boolean);
+  const normalizedOutbound = outboundTexts.map(normalizeDeliveryText);
+  const normalizedFull = normalizeDeliveryText(text);
+
+  if (!normalizedFull) {
+    return { delivered: false, reason: 'empty_text', rawCount: raw.length };
+  }
+
+  const fullIdx = normalizedOutbound.findIndex((out) => out === normalizedFull);
+  if (fullIdx >= 0) {
+    return { delivered: true, matchedText: outboundTexts[fullIdx], rawCount: raw.length };
+  }
+
+  for (let start = 0; start < normalizedOutbound.length; start++) {
+    let joined = '';
+    const matchedParts = [];
+    for (let end = start; end < Math.min(normalizedOutbound.length, start + 6); end++) {
+      joined = normalizeDeliveryText([joined, normalizedOutbound[end]].filter(Boolean).join(' '));
+      matchedParts.push(outboundTexts[end]);
+      if (joined === normalizedFull) {
+        return { delivered: true, matchedText: matchedParts.join('\n'), rawCount: raw.length };
+      }
+      if (joined.length > normalizedFull.length + 20) break;
+    }
+  }
+
+  return { delivered: false, rawCount: raw.length, outboundCount: outboundTexts.length };
+}
+
 function lastNonSystemRole(messages) {
   const tail = messages.filter((m) => m.role !== 'system');
   return tail.length ? tail[tail.length - 1].role : undefined;
@@ -443,6 +550,48 @@ function splitReplySmart(reply) {
 
   const mid = Math.ceil(text.length / 2);
   return mergeToParts([text.slice(0, mid), text.slice(mid)]);
+}
+
+async function sendUchatText(bot, subscriberId, text) {
+  if (!bot?.uchatApiKey) {
+    throw new Error(`UChat API key missing for bot=${bot?.id || 'unknown'}`);
+  }
+  const parts = splitReplySmart(text);
+  const chunks = parts.length ? parts : [String(text)];
+  for (let i = 0; i < chunks.length; i++) {
+    await axios.post(
+      UCHAT_URL,
+      { user_ns: subscriberId, content: chunks[i] },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${bot.uchatApiKey}`
+        },
+        timeout: 15000
+      }
+    );
+    if (i < chunks.length - 1) {
+      await sleep(1500 + Math.random() * 2500);
+    }
+  }
+  return chunks;
+}
+
+function formatMessageForGrok(message) {
+  if (!message?.imageUrl || message.role !== 'user') return message;
+  const text = String(message.content || '').trim() || 'sent you a photo';
+  return {
+    ...message,
+    content: [
+      { type: 'text', text },
+      { type: 'image_url', image_url: { url: message.imageUrl } }
+    ]
+  };
+}
+
+function formatMessagesForGrok(messages) {
+  if (!Array.isArray(messages)) return messages;
+  return messages.map(formatMessageForGrok);
 }
 
 async function loadPending(botId, subscriberId) {
@@ -572,7 +721,7 @@ async function flushPending(botId, subscriberId) {
     );
     if (countUserMessages(messagesForGrok) !== userSnap) return;
 
-    const grokMessages = withTimeAwareMessages(messagesForGrok, bot.timezone);
+    const grokMessages = formatMessagesForGrok(withTimeAwareMessages(messagesForGrok, bot.timezone));
 
     const grokResponse = await axios.post(
       GROK_URL,
@@ -824,13 +973,36 @@ function extractWebhookFields(body) {
     body.contact?.image,
     body.contact?.avatar
   );
+  const chatImageUrl = extractFirstImageUrl(
+    body.message_image,
+    body.message_image_url,
+    body.chat_image,
+    body.chat_image_url,
+    body.media_url,
+    body.attachment_url,
+    body.file_url,
+    body.image_url,
+    body.payload?.media_url,
+    body.payload?.attachment_url,
+    body.payload?.file_url,
+    body.payload?.image_url,
+    body.payload?.attachments,
+    body.attachments,
+    body.media,
+    body.files
+  );
+
+  if (!userText && chatImageUrl) {
+    userText = 'sent you a photo';
+  }
 
   return {
     subscriberId: subscriberId != null ? String(subscriberId) : undefined,
     userText: userText != null ? String(userText).trim() : undefined,
     firstName: firstName || undefined,
     igUsername: igUsername || undefined,
-    imageUrl: imageUrl || undefined
+    imageUrl: imageUrl || undefined,
+    chatImageUrl: chatImageUrl || undefined
   };
 }
 
@@ -852,7 +1024,7 @@ function redactMessagesForView(messages) {
   return messages.map((m) =>
     m.role === 'system'
       ? { role: 'system', content: '[system prompt]' }
-      : { role: m.role, content: m.content }
+      : { role: m.role, content: m.content, imageUrl: m.imageUrl }
   );
 }
 
@@ -973,6 +1145,7 @@ function adminPageShell(title, bodyHtml) {
   <a href="/failed?format=html${tokenQ}">Failed</a>
   <a href="/messages?format=html${tokenQ}">Messages</a>
   <a href="/triggers?format=html${tokenQ}">Triggers</a>
+  <a href="/delivery-check?format=html${tokenQ}">Delivery Check</a>
   <a href="/prompt-lab?format=html${tokenQ}">Prompt Lab</a>
 </nav>
 <h1>${escHtml(title)}</h1>
@@ -1029,10 +1202,90 @@ async function collectAllConversations(filterBotId) {
         meta,
         message_count: nonSys.length,
         last_role: last?.role || null,
-        last_preview: last?.content ? String(last.content).slice(0, 120) : null
+        last_preview: last?.content
+          ? `${last.imageUrl ? '[image] ' : ''}${String(last.content).slice(0, 120)}`
+          : (last?.imageUrl ? '[image]' : null)
       });
     }
   }
+  return rows;
+}
+
+async function collectDeliveryCheckRows(filterBotId, maxConversations) {
+  const botsToList = filterBotId
+    ? (getBot(filterBotId) ? [filterBotId.toLowerCase()] : [])
+    : listBotIds();
+  const safeLimit = Math.max(1, Math.min(Number(maxConversations) || 100, 500));
+  const rows = [];
+
+  for (const botId of botsToList) {
+    const bot = getBot(botId);
+    if (!bot) continue;
+    const ids = (await listConversationIds(botId)).slice(0, Math.max(0, safeLimit - rows.length));
+    for (const id of ids) {
+      const [messages, meta] = await Promise.all([
+        loadConversation(botId, id),
+        loadSubscriberMeta(botId, id)
+      ]);
+      if (!Array.isArray(messages)) continue;
+
+      const lastAssistant = getLastAssistantMessage(messages);
+      if (!lastAssistant) {
+        rows.push({
+          bot: bot.id,
+          subscriber_id: id,
+          meta,
+          status: 'skipped',
+          reason: 'no_assistant_message'
+        });
+        continue;
+      }
+
+      if (!bot.uchatApiKey) {
+        rows.push({
+          bot: bot.id,
+          subscriber_id: id,
+          meta,
+          status: 'error',
+          reason: 'missing_uchat_key',
+          assistant_index: lastAssistant.index,
+          assistant_preview: lastAssistant.content.slice(0, 220)
+        });
+        continue;
+      }
+
+      try {
+        const delivery = await uchatHasAssistantText(bot, id, lastAssistant.content);
+        rows.push({
+          bot: bot.id,
+          subscriber_id: id,
+          meta,
+          status: delivery.delivered ? 'delivered' : 'missing',
+          assistant_index: lastAssistant.index,
+          assistant_preview: lastAssistant.content.slice(0, 220),
+          raw_count: delivery.rawCount,
+          outbound_count: delivery.outboundCount ?? null,
+          matched_preview: delivery.matchedText ? String(delivery.matchedText).slice(0, 220) : null,
+          reason: delivery.reason || null
+        });
+      } catch (err) {
+        const detail = err.response?.data || err.message;
+        rows.push({
+          bot: bot.id,
+          subscriber_id: id,
+          meta,
+          status: 'error',
+          assistant_index: lastAssistant.index,
+          assistant_preview: lastAssistant.content.slice(0, 220),
+          error: typeof detail === 'string' ? detail.slice(0, 300) : rawJsonPreview(detail, 300)
+        });
+      }
+
+      if (rows.length >= safeLimit) break;
+    }
+    if (rows.length >= safeLimit) break;
+  }
+
   return rows;
 }
 
@@ -1135,7 +1388,7 @@ function makeWebhookHandler(botId) {
         });
       }
 
-      const { subscriberId, userText, firstName, igUsername, imageUrl } = extractWebhookFields(body);
+      const { subscriberId, userText, firstName, igUsername, imageUrl, chatImageUrl } = extractWebhookFields(body);
 
       if (!GROK_API_KEY) {
         console.error('❌ GROK_API_KEY missing');
@@ -1174,7 +1427,11 @@ function makeWebhookHandler(botId) {
         igUsername,
         userText
       );
-      messages.push({ role: 'user', content: userText });
+      messages.push({
+        role: 'user',
+        content: userText,
+        ...(chatImageUrl ? { imageUrl: chatImageUrl } : {})
+      });
       trimHistory(messages);
       await saveConversation(bot.id, subscriberId, messages);
 
@@ -1182,6 +1439,7 @@ function makeWebhookHandler(botId) {
         firstName,
         igUsername,
         imageUrl,
+        chatImageUrl,
         path: req.path
       });
       const waitMs = dueAt - Date.now();
@@ -1198,6 +1456,7 @@ function makeWebhookHandler(botId) {
         first_name: firstName ?? null,
         ig_username: igUsername ?? null,
         image_url: imageUrl ?? null,
+        chat_image_url: chatImageUrl ?? null,
         user_text: userText,
         scheduled_for: new Date(dueAt).toISOString(),
         import_status: importStatus || null,
@@ -1214,7 +1473,7 @@ function makeWebhookHandler(botId) {
       const detail = err.response?.data || err.message;
       console.error('❌ Webhook error:', detail);
       const body = req.body;
-      const { subscriberId, userText, firstName, igUsername, imageUrl } = extractWebhookFields(body || {});
+      const { subscriberId, userText, firstName, igUsername, imageUrl, chatImageUrl } = extractWebhookFields(body || {});
       pushTrigger({
         id: triggerId,
         at: new Date().toISOString(),
@@ -1224,6 +1483,7 @@ function makeWebhookHandler(botId) {
         first_name: firstName ?? null,
         ig_username: igUsername ?? null,
         image_url: imageUrl ?? null,
+        chat_image_url: chatImageUrl ?? null,
         user_text: userText ?? null,
         error: typeof detail === 'string' ? detail.slice(0, 500) : rawJsonPreview(detail, 800),
         raw_json: rawJsonPreview(body || {})
@@ -1334,7 +1594,7 @@ app.get('/triggers', (req, res) => {
         return `<tr><td style="white-space:nowrap">${esc(t.at)}</td><td><code>${esc(
           t.bot || ''
         )}</code></td><td><code>${esc(t.outcome)}</code></td><td>${renderSubscriberCell(meta, t.subscriber_id ?? '')}</td><td>${esc(
-          (t.user_text || '').slice(0, 120)
+          `${t.chat_image_url ? '[image] ' : ''}${(t.user_text || '').slice(0, 120)}`
         )}</td><td>${esc(formatImport(t.import_status))}</td><td>${esc(t.reason || t.error || t.reply_preview || '')}</td></tr>
 <tr><td colspan="7" style="background:#fafafa;font-size:12px"><details><summary>raw JSON</summary><pre style="white-space:pre-wrap;word-break:break-all;margin:8px 0">${raw}</pre></details></td></tr>`;
       })
@@ -1393,7 +1653,9 @@ app.get('/messages', async (req, res) => {
           meta,
           message_count: nonSys.length,
           last_role: last?.role,
-          last_preview: last?.content ? String(last.content).slice(0, 120) : null
+          last_preview: last?.content
+            ? `${last.imageUrl ? '[image] ' : ''}${String(last.content).slice(0, 120)}`
+            : (last?.imageUrl ? '[image]' : null)
         });
       }
     }
@@ -1468,8 +1730,12 @@ async function renderThread(req, res, botId, subscriberId) {
       : '';
     const blocks = view
       .map(
-        (m) =>
-          `<div class="bubble ${esc(m.role)}"><strong>${esc(m.role)}</strong><pre>${esc(m.content)}</pre></div>`
+        (m) => {
+          const imageHtml = m.imageUrl
+            ? `<div style="margin-top:.6rem"><a href="${esc(m.imageUrl)}" target="_blank" rel="noreferrer"><img src="${esc(m.imageUrl)}" alt="chat image" style="max-width:min(100%,320px);border-radius:12px;border:1px solid #dbe1ea"></a></div>`
+            : '';
+          return `<div class="bubble ${esc(m.role)}"><strong>${esc(m.role)}</strong><pre>${esc(m.content)}</pre>${imageHtml}</div>`;
+        }
       )
       .join('\n');
     const bodyHtml = `
@@ -1513,6 +1779,161 @@ app.get('/messages/:subscriberId', async (req, res) => {
   await renderThread(req, res, DEFAULT_BOT_ID, req.params.subscriberId);
 });
 
+app.get('/delivery-check', async (req, res) => {
+  if (!assertViewMessagesAuth(req, res)) return;
+
+  try {
+    const filterBot = req.query.bot ? String(req.query.bot).toLowerCase() : null;
+    const limit = parseInt(req.query.limit || '100', 10);
+    const rows = await collectDeliveryCheckRows(filterBot, limit);
+    const counts = rows.reduce((acc, row) => {
+      acc[row.status] = (acc[row.status] || 0) + 1;
+      return acc;
+    }, {});
+
+    if (!wantsHtmlResponse(req)) {
+      return res.json({
+        count: rows.length,
+        counts,
+        bot_filter: filterBot,
+        rows
+      });
+    }
+
+    const tokenQ = tokenQuerySuffix();
+    const botOptions = [
+      `<option value=""${filterBot ? '' : ' selected'}>all bots</option>`,
+      ...listBotIds().map((id) => `<option value="${escHtml(id)}"${id === filterBot ? ' selected' : ''}>${escHtml(id)}</option>`)
+    ].join('');
+    const statusNote = req.query.resend
+      ? `<div class="card"><strong>Resend:</strong> ${escHtml(req.query.resend)}</div>`
+      : '';
+
+    const trs = rows
+      .map((row) => {
+        const statusHtml = row.status === 'missing'
+          ? '<span class="bad">missing</span>'
+          : row.status === 'delivered'
+            ? '<span class="ok">delivered</span>'
+            : `<span class="pill">${escHtml(row.status)}</span>`;
+        const resendHtml = row.status === 'missing'
+          ? `<form method="post" action="/delivery-check/resend?format=html${tokenQ}" onsubmit="return confirm('Resend this saved assistant reply to UChat?')">
+              <input type="hidden" name="botId" value="${escHtml(row.bot)}">
+              <input type="hidden" name="subscriberId" value="${escHtml(row.subscriber_id)}">
+              <input type="hidden" name="assistantIndex" value="${escHtml(row.assistant_index)}">
+              <button class="button" type="submit">Resend</button>
+            </form>`
+          : '';
+        const detail = row.error || row.reason || (row.matched_preview ? `matched: ${row.matched_preview}` : '');
+        return `<tr>
+          <td><span class="pill">${escHtml(row.bot)}</span></td>
+          <td>${renderSubscriberCell(row.meta, row.subscriber_id)}</td>
+          <td>${statusHtml}</td>
+          <td><pre>${escHtml(row.assistant_preview || '')}</pre></td>
+          <td>${escHtml(detail)}</td>
+          <td>${resendHtml}</td>
+        </tr>`;
+      })
+      .join('');
+
+    const body = `
+      ${statusNote}
+      <p class="muted">Checks only the last assistant message per conversation. Nothing is resent unless you click Resend.</p>
+      <form method="get" action="/delivery-check" class="card">
+        <input type="hidden" name="format" value="html">
+        <p><label>Bot<br><select name="bot">${botOptions}</select></label></p>
+        <p><label>Max conversations<br><input name="limit" type="number" min="1" max="500" value="${escHtml(Number.isFinite(limit) ? limit : 100)}"></label></p>
+        ${VIEW_MESSAGES_TOKEN ? `<input type="hidden" name="token" value="${escHtml(VIEW_MESSAGES_TOKEN)}">` : ''}
+        <button class="button" type="submit">Scan delivery</button>
+        <a class="button" href="/delivery-check?format=json${tokenQ}">JSON</a>
+      </form>
+      <div class="card">
+        <strong>Summary:</strong>
+        delivered ${escHtml(counts.delivered || 0)} · missing ${escHtml(counts.missing || 0)} · errors ${escHtml(counts.error || 0)} · skipped ${escHtml(counts.skipped || 0)}
+      </div>
+      <table>
+        <thead><tr><th>Bot</th><th>User</th><th>Status</th><th>Last assistant reply</th><th>Detail</th><th>Action</th></tr></thead>
+        <tbody>${trs || '<tr><td colspan="6" class="muted">No conversations found.</td></tr>'}</tbody>
+      </table>
+    `;
+    return res.type('html').send(adminPageShell('Delivery Check', body));
+  } catch (err) {
+    console.error('❌ /delivery-check error:', err.response?.data || err.message);
+    return res.status(500).json({ error: 'Failed to check delivery', detail: err.message });
+  }
+});
+
+app.post('/delivery-check/resend', async (req, res) => {
+  if (!assertViewMessagesAuth(req, res)) return;
+
+  const botId = String(req.body.botId || '').toLowerCase();
+  const subscriberId = String(req.body.subscriberId || '').trim();
+  const assistantIndex = Number(req.body.assistantIndex);
+  const bot = getBot(botId);
+
+  try {
+    if (!bot) return res.status(404).json({ status: 'error', reason: 'unknown_bot' });
+    if (!subscriberId || !Number.isInteger(assistantIndex)) {
+      return res.status(400).json({ status: 'error', reason: 'missing_or_invalid_input' });
+    }
+
+    const messages = await loadConversation(bot.id, subscriberId);
+    const msg = Array.isArray(messages) ? messages[assistantIndex] : null;
+    if (!msg || msg.role !== 'assistant' || !String(msg.content || '').trim()) {
+      return res.status(409).json({ status: 'error', reason: 'assistant_message_changed' });
+    }
+
+    const delivery = await uchatHasAssistantText(bot, subscriberId, msg.content);
+    if (delivery.delivered) {
+      pushTrigger({
+        id: `${Date.now()}-delivery-skip-${Math.random().toString(36).slice(2, 9)}`,
+        at: new Date().toISOString(),
+        outcome: 'delivery_already_delivered',
+        bot: bot.id,
+        subscriber_id: subscriberId,
+        reply_preview: String(msg.content).slice(0, 200)
+      });
+      if (wantsHtmlResponse(req)) {
+        return res.redirect(`/delivery-check?format=html&bot=${encodeURIComponent(bot.id)}&resend=already_delivered${tokenQuerySuffix()}`);
+      }
+      return res.json({ status: 'already_delivered', delivery });
+    }
+
+    const chunks = await sendUchatText(bot, subscriberId, msg.content);
+    pushTrigger({
+      id: `${Date.now()}-delivery-resend-${Math.random().toString(36).slice(2, 9)}`,
+      at: new Date().toISOString(),
+      outcome: 'delivery_resend',
+      bot: bot.id,
+      subscriber_id: subscriberId,
+      assistant_index: assistantIndex,
+      uchat_parts: chunks.length,
+      reply_preview: String(msg.content).slice(0, 200)
+    });
+
+    if (wantsHtmlResponse(req)) {
+      return res.redirect(`/delivery-check?format=html&bot=${encodeURIComponent(bot.id)}&resend=sent${tokenQuerySuffix()}`);
+    }
+    return res.json({
+      status: 'sent',
+      bot: bot.id,
+      subscriber_id: subscriberId,
+      assistant_index: assistantIndex,
+      chunks: chunks.length
+    });
+  } catch (err) {
+    const detail = err.response?.data || err.message;
+    console.error('❌ /delivery-check/resend error:', detail);
+    if (wantsHtmlResponse(req)) {
+      return res.redirect(`/delivery-check?format=html&bot=${encodeURIComponent(botId)}&resend=error${tokenQuerySuffix()}`);
+    }
+    return res.status(500).json({
+      status: 'error',
+      reason: typeof detail === 'string' ? detail : rawJsonPreview(detail, 500)
+    });
+  }
+});
+
 // ── Admin / debug panel ──────────────────────────────────────────────────────
 app.get('/admin', async (req, res) => {
   if (!assertViewMessagesAuth(req, res)) return;
@@ -1544,6 +1965,7 @@ app.get('/admin', async (req, res) => {
         failed: `/failed${tokenFirst}`,
         messages: `/messages${tokenFirst}`,
         triggers: `/triggers${tokenFirst}`,
+        delivery_check: `/delivery-check${tokenFirst}`,
         prompt_lab: `/prompt-lab${tokenFirst}`
       }
     });
@@ -1559,6 +1981,7 @@ app.get('/admin', async (req, res) => {
         <tr><td>Pending replies</td><td>${pending.length}</td><td><a href="/pending?format=html${tokenQ}">/pending</a></td></tr>
         <tr><td>History imports</td><td>${imports.length}</td><td><a href="/history-imports?format=html${tokenQ}">/history-imports</a></td></tr>
         <tr><td>Failed / discarded (recent)</td><td>${failed.length}</td><td><a href="/failed?format=html${tokenQ}">/failed</a></td></tr>
+        <tr><td>Delivery Check</td><td>review resend</td><td><a href="/delivery-check?format=html${tokenQ}">/delivery-check</a></td></tr>
         <tr><td>Prompt Lab</td><td>drafts / fixtures</td><td><a href="/prompt-lab?format=html${tokenQ}">/prompt-lab</a></td></tr>
       </tbody>
     </table>
@@ -1856,6 +2279,9 @@ async function startServer() {
     );
     console.log(
       `   GET  /admin?format=html      ← Admin / debug panel${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
+    );
+    console.log(
+      `   GET  /delivery-check?format=html ← Review missing UChat deliveries${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
     );
     console.log(
       `   GET  /prompt-lab?format=html ← Prompt drafts + A/B tests${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`

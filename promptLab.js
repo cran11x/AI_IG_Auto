@@ -259,7 +259,16 @@ function createPromptLab(deps) {
     if (!GROK_API_KEY) throw new Error('GROK_API_KEY not configured');
     const bot = getBot(botId) || getBot('esma');
     const messages = [{ role: 'system', content: promptBody }, ...contextMessages];
-    const payloadMessages = withTimeAwareMessages(messages, bot?.timezone);
+    const payloadMessages = withTimeAwareMessages(messages, bot?.timezone).map((message) => {
+      if (message.role !== 'user' || !message.imageUrl) return message;
+      return {
+        ...message,
+        content: [
+          { type: 'text', text: String(message.content || '').trim() || 'sent you a photo' },
+          { type: 'image_url', image_url: { url: message.imageUrl } }
+        ]
+      };
+    });
     const res = await axios.post(
       GROK_URL,
       { model: GROK_MODEL, messages: payloadMessages, temperature: 0.8 },
@@ -287,7 +296,11 @@ function createPromptLab(deps) {
     const turns = [];
     for (const msg of sourceMessages) {
       if (msg.role !== 'user') continue;
-      generatedContext.push({ role: 'user', content: msg.content });
+      generatedContext.push({
+        role: 'user',
+        content: msg.content,
+        ...(msg.imageUrl ? { imageUrl: msg.imageUrl } : {})
+      });
       const reply = await callGrokWithPrompt(source.body, generatedContext, botId);
       turns.push({ turn: turns.length + 1, user: msg.content, reply, contextCount: generatedContext.length });
       generatedContext.push({ role: 'assistant', content: reply });
@@ -569,7 +582,11 @@ function createPromptLab(deps) {
         botId: bot.id,
         subscriberId,
         capturedAt: nowIso(),
-        messages: messages.map((m) => ({ role: m.role, content: m.content })),
+        messages: messages.map((m) => ({
+          role: m.role,
+          content: m.content,
+          ...(m.imageUrl ? { imageUrl: m.imageUrl } : {})
+        })),
         meta
       };
       await saveFixture(fixture);
