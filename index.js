@@ -275,14 +275,26 @@ function isKnownTestSubscriberId(subscriberId) {
 
 // ── UChat chat-messages import (one-shot bootstrap) ──────────────────────────
 async function fetchUchatChatMessages(bot, subscriberId, limit) {
+  return fetchUchatChatMessagesWithOptions(bot, { user_ns: subscriberId, limit });
+}
+
+async function fetchUchatChatMessagesWithOptions(bot, options) {
+  const params = {
+    user_ns: options.user_ns,
+    user_id: options.user_id,
+    include_bot: options.include_bot ?? 1,
+    include_note: options.include_note ?? 0,
+    include_system: options.include_system ?? 0,
+    msg_type: options.msg_type,
+    start_time: options.start_time,
+    end_time: options.end_time,
+    limit: options.limit
+  };
+  Object.keys(params).forEach((key) => {
+    if (params[key] == null || params[key] === '') delete params[key];
+  });
   const response = await axios.get(UCHAT_HISTORY_URL, {
-    params: {
-      user_ns: subscriberId,
-      include_bot: 1,
-      include_note: 0,
-      include_system: 0,
-      limit
-    },
+    params,
     headers: {
       Accept: 'application/json',
       Authorization: `Bearer ${bot.uchatApiKey}`
@@ -327,6 +339,47 @@ function normalizeUchatMessages(rawMessages, latestUserText, limit) {
   }
 
   return tail;
+}
+
+function normalizeUchatLiveChatMessages(rawMessages, limit) {
+  if (!Array.isArray(rawMessages) || rawMessages.length === 0) return [];
+  const sorted = rawMessages
+    .filter((m) => m && typeof m === 'object')
+    .slice()
+    .sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0));
+  const out = [];
+  for (const m of sorted) {
+    const type = String(m.type || '').toLowerCase();
+    if (type === 'note' || type === 'system') continue;
+    const msgType = String(m.msg_type || 'text').toLowerCase();
+    const role = type === 'in' ? 'user' : 'assistant';
+    const text = getUchatMessageText(m);
+    const imageUrl = msgType === 'image' ? extractFirstImageUrl(m.payload, m.content, m) : undefined;
+    const createdAt = getUchatMessageTime(m);
+    const content = text || (imageUrl ? 'sent you a photo' : '');
+    if (!content && !imageUrl) continue;
+    out.push({
+      role,
+      content,
+      ...(createdAt ? { createdAt } : {}),
+      ...(imageUrl ? { imageUrl } : {}),
+      uchat: {
+        id: m.id ?? null,
+        type: m.type ?? null,
+        msg_type: m.msg_type ?? null,
+        sender_id: m.sender_id ?? null,
+        ts: m.ts ?? null
+      }
+    });
+  }
+  const safeLimit = Math.max(1, Number(limit) || 100);
+  return out.slice(-safeLimit);
+}
+
+async function buildSystemMessageForExistingConversation(bot, subscriberId, existingMessages) {
+  const meta = await loadSubscriberMeta(bot.id, subscriberId);
+  const content = await buildSystemPrompt(bot, meta.firstName, meta.igUsername, existingMessages);
+  return { role: 'system', content };
 }
 
 async function bootstrapHistoryForNewConversation(bot, subscriberId, customPrompt, latestUserText) {
@@ -1171,6 +1224,7 @@ function adminPageShell(title, bodyHtml) {
   <a href="/messages?format=html${tokenQ}">Messages</a>
   <a href="/triggers?format=html${tokenQ}">Triggers</a>
   <a href="/delivery-check?format=html${tokenQ}">Delivery Check</a>
+  <a href="/live-chat-sync?format=html${tokenQ}">Live Chat Sync</a>
   <a href="/prompt-lab?format=html${tokenQ}">Prompt Lab</a>
 </nav>
 <h1>${escHtml(title)}</h1>
@@ -1978,6 +2032,155 @@ app.post('/delivery-check/resend', async (req, res) => {
   }
 });
 
+app.get('/live-chat-sync', async (req, res) => {
+  if (!assertViewMessagesAuth(req, res)) return;
+
+  const botId = String(req.query.bot || DEFAULT_BOT_ID).toLowerCase();
+  const subscriberId = String(req.query.subscriberId || req.query.user_ns || '').trim();
+  const limit = Math.max(1, Math.min(parseInt(req.query.limit || '50', 10) || 50, 100));
+  const bot = getBot(botId);
+
+  try {
+    if (!bot) return res.status(404).json({ error: 'Unknown bot', bot: botId });
+    if (!wantsHtmlResponse(req) && !subscriberId) {
+      return res.status(400).json({ error: 'Missing subscriberId/user_ns' });
+    }
+
+    const localMessages = subscriberId ? (await loadConversation(bot.id, subscriberId)) || [] : [];
+    const meta = subscriberId ? await loadSubscriberMeta(bot.id, subscriberId) : {};
+    let raw = [];
+    let normalized = [];
+    let fetchError = null;
+    if (subscriberId) {
+      try {
+        raw = await fetchUchatChatMessagesWithOptions(bot, {
+          user_ns: subscriberId,
+          include_bot: 1,
+          include_note: 0,
+          include_system: 0,
+          limit
+        });
+        normalized = normalizeUchatLiveChatMessages(raw, limit);
+      } catch (err) {
+        const detail = err.response?.data || err.message;
+        fetchError = typeof detail === 'string' ? detail : rawJsonPreview(detail, 500);
+      }
+    }
+
+    if (!wantsHtmlResponse(req)) {
+      return res.json({
+        bot: bot.id,
+        subscriber_id: subscriberId,
+        local_count: Array.isArray(localMessages) ? localMessages.filter((m) => m.role !== 'system').length : 0,
+        uchat_raw_count: raw.length,
+        normalized_count: normalized.length,
+        fetch_error: fetchError,
+        messages: normalized,
+        raw
+      });
+    }
+
+    const tokenQ = tokenQuerySuffix();
+    const botOptions = listBotIds()
+      .map((id) => `<option value="${escHtml(id)}"${id === bot.id ? ' selected' : ''}>${escHtml(id)}</option>`)
+      .join('');
+    const previewRows = normalized
+      .map((m) => `<tr>
+        <td><span class="pill">${escHtml(m.role)}</span></td>
+        <td>${escHtml(m.createdAt || '')}</td>
+        <td><pre>${escHtml(m.content || '')}</pre>${m.imageUrl ? `<a href="${escHtml(m.imageUrl)}" target="_blank" rel="noreferrer">image</a>` : ''}</td>
+        <td><code>${escHtml(m.uchat?.id ?? '')}</code> ${escHtml(m.uchat?.msg_type || '')}</td>
+      </tr>`)
+      .join('');
+    const localCount = Array.isArray(localMessages) ? localMessages.filter((m) => m.role !== 'system').length : 0;
+    const body = `
+      <p class="muted">Pulls UChat live chat messages for one subscriber and lets you replace local Redis conversation history with that UChat history. This is UChat sync, not direct Instagram API sync.</p>
+      <form method="get" action="/live-chat-sync" class="card">
+        <input type="hidden" name="format" value="html">
+        ${VIEW_MESSAGES_TOKEN ? `<input type="hidden" name="token" value="${escHtml(VIEW_MESSAGES_TOKEN)}">` : ''}
+        <p><label>Bot<br><select name="bot">${botOptions}</select></label></p>
+        <p><label>Subscriber user_ns<br><input name="subscriberId" value="${escHtml(subscriberId)}" style="width:100%" required></label></p>
+        <p><label>Limit<br><input name="limit" type="number" min="1" max="100" value="${escHtml(limit)}"></label></p>
+        <button class="button" type="submit">Pull UChat live chat</button>
+      </form>
+      ${subscriberId ? `<div class="card">
+        ${renderSubscriberCell(meta, subscriberId)}
+        <p class="muted">Local messages: ${escHtml(localCount)} · UChat raw: ${escHtml(raw.length)} · normalized: ${escHtml(normalized.length)}</p>
+        ${fetchError ? `<p class="bad">${escHtml(fetchError)}</p>` : ''}
+        ${normalized.length ? `<form method="post" action="/live-chat-sync/apply?format=html${tokenQ}" onsubmit="return confirm('Replace local conversation history with this UChat live chat snapshot?')">
+          <input type="hidden" name="botId" value="${escHtml(bot.id)}">
+          <input type="hidden" name="subscriberId" value="${escHtml(subscriberId)}">
+          <input type="hidden" name="limit" value="${escHtml(limit)}">
+          <button class="button" type="submit">Sync local history from UChat</button>
+        </form>` : ''}
+      </div>` : ''}
+      <table>
+        <thead><tr><th>Role</th><th>Time</th><th>Message</th><th>UChat</th></tr></thead>
+        <tbody>${previewRows || '<tr><td colspan="4" class="muted">Enter subscriber user_ns and pull live chat.</td></tr>'}</tbody>
+      </table>
+    `;
+    return res.type('html').send(adminPageShell('Live Chat Sync', body));
+  } catch (err) {
+    console.error('❌ /live-chat-sync error:', err.response?.data || err.message);
+    return res.status(500).json({ error: 'Failed to pull live chat', detail: err.message });
+  }
+});
+
+app.post('/live-chat-sync/apply', async (req, res) => {
+  if (!assertViewMessagesAuth(req, res)) return;
+
+  const botId = String(req.body.botId || DEFAULT_BOT_ID).toLowerCase();
+  const subscriberId = String(req.body.subscriberId || '').trim();
+  const limit = Math.max(1, Math.min(parseInt(req.body.limit || '50', 10) || 50, 100));
+  const bot = getBot(botId);
+
+  try {
+    if (!bot) return res.status(404).json({ error: 'Unknown bot', bot: botId });
+    if (!subscriberId) return res.status(400).json({ error: 'Missing subscriberId' });
+    const existing = (await loadConversation(bot.id, subscriberId)) || [];
+    const raw = await fetchUchatChatMessagesWithOptions(bot, {
+      user_ns: subscriberId,
+      include_bot: 1,
+      include_note: 0,
+      include_system: 0,
+      limit
+    });
+    const normalized = normalizeUchatLiveChatMessages(raw, limit);
+    const systemMessage = await buildSystemMessageForExistingConversation(bot, subscriberId, existing);
+    const nextMessages = [systemMessage, ...normalized];
+    trimHistory(nextMessages);
+    await saveConversation(bot.id, subscriberId, nextMessages);
+
+    pushTrigger({
+      id: `${Date.now()}-live-chat-sync-${Math.random().toString(36).slice(2, 9)}`,
+      at: new Date().toISOString(),
+      outcome: 'live_chat_sync',
+      bot: bot.id,
+      subscriber_id: subscriberId,
+      imported_count: normalized.length,
+      raw_count: raw.length
+    });
+
+    if (wantsHtmlResponse(req)) {
+      return res.redirect(`/messages/${encodeURIComponent(bot.id)}/${encodeURIComponent(subscriberId)}?format=html${tokenQuerySuffix()}`);
+    }
+    return res.json({
+      status: 'ok',
+      bot: bot.id,
+      subscriber_id: subscriberId,
+      imported_count: normalized.length,
+      raw_count: raw.length
+    });
+  } catch (err) {
+    const detail = err.response?.data || err.message;
+    console.error('❌ /live-chat-sync/apply error:', detail);
+    return res.status(500).json({
+      error: 'Failed to sync live chat',
+      detail: typeof detail === 'string' ? detail : rawJsonPreview(detail, 500)
+    });
+  }
+});
+
 // ── Admin / debug panel ──────────────────────────────────────────────────────
 app.get('/admin', async (req, res) => {
   if (!assertViewMessagesAuth(req, res)) return;
@@ -2010,6 +2213,7 @@ app.get('/admin', async (req, res) => {
         messages: `/messages${tokenFirst}`,
         triggers: `/triggers${tokenFirst}`,
         delivery_check: `/delivery-check${tokenFirst}`,
+        live_chat_sync: `/live-chat-sync${tokenFirst}`,
         prompt_lab: `/prompt-lab${tokenFirst}`
       }
     });
@@ -2026,6 +2230,7 @@ app.get('/admin', async (req, res) => {
         <tr><td>History imports</td><td>${imports.length}</td><td><a href="/history-imports?format=html${tokenQ}">/history-imports</a></td></tr>
         <tr><td>Failed / discarded (recent)</td><td>${failed.length}</td><td><a href="/failed?format=html${tokenQ}">/failed</a></td></tr>
         <tr><td>Delivery Check</td><td>review resend</td><td><a href="/delivery-check?format=html${tokenQ}">/delivery-check</a></td></tr>
+        <tr><td>Live Chat Sync</td><td>pull UChat history</td><td><a href="/live-chat-sync?format=html${tokenQ}">/live-chat-sync</a></td></tr>
         <tr><td>Prompt Lab</td><td>drafts / fixtures</td><td><a href="/prompt-lab?format=html${tokenQ}">/prompt-lab</a></td></tr>
       </tbody>
     </table>
@@ -2326,6 +2531,9 @@ async function startServer() {
     );
     console.log(
       `   GET  /delivery-check?format=html ← Review missing UChat deliveries${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
+    );
+    console.log(
+      `   GET  /live-chat-sync?format=html ← Pull UChat live chat history${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
     );
     console.log(
       `   GET  /prompt-lab?format=html ← Prompt drafts + A/B tests${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
