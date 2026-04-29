@@ -195,8 +195,8 @@ async function syncConversationSystemPrompt(bot, subscriberId, messages) {
     if (messages[0].content !== systemPrompt) {
       messages[0] = { ...messages[0], content: systemPrompt };
       await saveConversation(bot.id, subscriberId, messages);
-    }
-  } else {
+      }
+    } else {
     messages.unshift({ role: 'system', content: systemPrompt });
     await saveConversation(bot.id, subscriberId, messages);
   }
@@ -1450,10 +1450,10 @@ promptLab = createPromptLab({
 // ── Webhook handler factory (per-bot route → shared logic) ───────────────────
 function makeWebhookHandler(botId) {
   return async (req, res) => {
-    const triggerId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  const triggerId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
     const bot = getBot(botId);
-    try {
-      const body = req.body;
+  try {
+    const body = req.body;
       console.log(`📩 [${bot ? bot.id : '?'}] Incoming webhook:`, JSON.stringify(body).slice(0, 500));
 
       if (!bot) {
@@ -1478,27 +1478,27 @@ function makeWebhookHandler(botId) {
         return res.status(500).json({ status: 'error', reason: 'GROK_API_KEY not configured' });
       }
 
-      if (!subscriberId || !userText) {
+    if (!subscriberId || !userText) {
         const reason = !subscriberId ? 'missing_sender_id' : 'missing_text';
         console.warn('⚠️  Skipping (queue):', { bot: bot.id, reason, subscriberId, userText });
-        pushTrigger({
-          id: triggerId,
-          at: new Date().toISOString(),
-          outcome: 'skipped',
-          reason,
+      pushTrigger({
+        id: triggerId,
+        at: new Date().toISOString(),
+        outcome: 'skipped',
+        reason,
           bot: bot.id,
-          subscriber_id: subscriberId ?? null,
-          first_name: firstName ?? null,
-          ig_username: igUsername ?? null,
+        subscriber_id: subscriberId ?? null,
+        first_name: firstName ?? null,
+        ig_username: igUsername ?? null,
           image_url: imageUrl ?? null,
-          user_text: userText ?? null,
-          raw_json: rawJsonPreview(body)
-        });
-        return res.status(400).json({
-          status: 'error',
-          reason: 'Missing sender_id or text in body'
-        });
-      }
+        user_text: userText ?? null,
+        raw_json: rawJsonPreview(body)
+      });
+      return res.status(400).json({
+        status: 'error',
+        reason: 'Missing sender_id or text in body'
+      });
+    }
 
       console.log(`👤 [${bot.id}/${subscriberId}] User says: "${userText}"`);
       await saveSubscriberMeta(bot.id, subscriberId, { firstName, igUsername, imageUrl });
@@ -1516,7 +1516,7 @@ function makeWebhookHandler(botId) {
         createdAt: new Date().toISOString(),
         ...(chatImageUrl ? { imageUrl: chatImageUrl } : {})
       });
-      trimHistory(messages);
+    trimHistory(messages);
       await saveConversation(bot.id, subscriberId, messages);
 
       const dueAt = await schedulePending(bot.id, subscriberId, {
@@ -1531,50 +1531,50 @@ function makeWebhookHandler(botId) {
         `⏱️  [${bot.id}/${subscriberId}] Reply scheduled in ${formatDelay(waitMs)} (at ${new Date(dueAt).toISOString()})`
       );
 
-      pushTrigger({
-        id: triggerId,
-        at: new Date().toISOString(),
+    pushTrigger({
+      id: triggerId,
+      at: new Date().toISOString(),
         outcome: 'queued',
         bot: bot.id,
-        subscriber_id: subscriberId,
-        first_name: firstName ?? null,
-        ig_username: igUsername ?? null,
+      subscriber_id: subscriberId,
+      first_name: firstName ?? null,
+      ig_username: igUsername ?? null,
         image_url: imageUrl ?? null,
         chat_image_url: chatImageUrl ?? null,
-        user_text: userText,
+      user_text: userText,
         scheduled_for: new Date(dueAt).toISOString(),
         import_status: importStatus || null,
-        raw_json: rawJsonPreview(body)
-      });
+      raw_json: rawJsonPreview(body)
+    });
 
       return res.status(202).json({
         status: 'queued',
         bot: bot.id,
         scheduled_for: new Date(dueAt).toISOString(),
-        sender_id: subscriberId
-      });
-    } catch (err) {
-      const detail = err.response?.data || err.message;
-      console.error('❌ Webhook error:', detail);
-      const body = req.body;
+      sender_id: subscriberId
+    });
+  } catch (err) {
+    const detail = err.response?.data || err.message;
+    console.error('❌ Webhook error:', detail);
+    const body = req.body;
       const { subscriberId, userText, firstName, igUsername, imageUrl, chatImageUrl } = extractWebhookFields(body || {});
-      pushTrigger({
-        id: triggerId,
-        at: new Date().toISOString(),
-        outcome: 'error',
+    pushTrigger({
+      id: triggerId,
+      at: new Date().toISOString(),
+      outcome: 'error',
         bot: bot ? bot.id : botId,
-        subscriber_id: subscriberId ?? null,
-        first_name: firstName ?? null,
-        ig_username: igUsername ?? null,
+      subscriber_id: subscriberId ?? null,
+      first_name: firstName ?? null,
+      ig_username: igUsername ?? null,
         image_url: imageUrl ?? null,
         chat_image_url: chatImageUrl ?? null,
-        user_text: userText ?? null,
-        error: typeof detail === 'string' ? detail.slice(0, 500) : rawJsonPreview(detail, 800),
-        raw_json: rawJsonPreview(body || {})
-      });
-      return res.status(500).json({ error: 'Internal server error', detail });
-    }
-  };
+      user_text: userText ?? null,
+      error: typeof detail === 'string' ? detail.slice(0, 500) : rawJsonPreview(detail, 800),
+      raw_json: rawJsonPreview(body || {})
+    });
+    return res.status(500).json({ error: 'Internal server error', detail });
+  }
+};
 }
 
 // ── Routes ───────────────────────────────────────────────────────────────────
@@ -1712,15 +1712,15 @@ app.get('/messages', async (req, res) => {
   if (!assertViewMessagesAuth(req, res)) return;
 
   try {
-    const wantsHtml =
-      req.query.format === 'html' ||
-      (typeof req.headers.accept === 'string' &&
-        req.headers.accept.includes('text/html'));
+  const wantsHtml =
+    req.query.format === 'html' ||
+    (typeof req.headers.accept === 'string' &&
+      req.headers.accept.includes('text/html'));
 
     const filterBot = req.query.bot ? String(req.query.bot).toLowerCase() : null;
     const botsToList = filterBot ? [filterBot] : listBotIds();
 
-    const rows = [];
+  const rows = [];
     for (const botId of botsToList) {
       if (!getBot(botId)) continue;
       const ids = await listConversationIds(botId);
@@ -1729,36 +1729,36 @@ app.get('/messages', async (req, res) => {
       );
       for (const [id, msgs, meta] of tuples) {
         if (!Array.isArray(msgs)) continue;
-        const nonSys = msgs.filter((m) => m.role !== 'system');
-        const last = nonSys[nonSys.length - 1];
-        rows.push({
+    const nonSys = msgs.filter((m) => m.role !== 'system');
+    const last = nonSys[nonSys.length - 1];
+    rows.push({
           bot: botId,
-          subscriber_id: id,
+      subscriber_id: id,
           meta,
-          message_count: nonSys.length,
-          last_role: last?.role,
-          last_preview: last?.content
+      message_count: nonSys.length,
+      last_role: last?.role,
+      last_preview: last?.content
             ? `${last.imageUrl ? '[image] ' : ''}${String(last.content).slice(0, 120)}`
             : (last?.imageUrl ? '[image]' : null)
-        });
+    });
       }
-    }
+  }
 
-    if (wantsHtml) {
-      const esc = (s) =>
-        String(s)
-          .replace(/&/g, '&amp;')
-          .replace(/</g, '&lt;')
-          .replace(/>/g, '&gt;');
-      const tokenQ = VIEW_MESSAGES_TOKEN
-        ? `&token=${encodeURIComponent(VIEW_MESSAGES_TOKEN)}`
-        : '';
-      const lines = rows
-        .map(
-          (r) =>
+  if (wantsHtml) {
+    const esc = (s) =>
+      String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    const tokenQ = VIEW_MESSAGES_TOKEN
+      ? `&token=${encodeURIComponent(VIEW_MESSAGES_TOKEN)}`
+      : '';
+    const lines = rows
+      .map(
+        (r) =>
             `<tr><td><code>${esc(r.bot)}</code></td><td>${renderSubscriberCell(r.meta, r.subscriber_id)}<a class="muted" href="/messages/${encodeURIComponent(r.bot)}/${encodeURIComponent(r.subscriber_id)}?format=html${tokenQ}">open thread</a></td><td>${r.message_count}</td><td>${esc(r.last_role || '')}</td><td>${esc(r.last_preview || '')}</td></tr>`
-        )
-        .join('\n');
+      )
+      .join('\n');
       const bodyHtml = `
         <p class="muted">${redisEnabled ? 'Redis-backed' : 'In-memory'} threads. ${VIEW_MESSAGES_TOKEN ? 'Token required.' : ''}</p>
         <div class="actions">
@@ -1769,12 +1769,12 @@ app.get('/messages', async (req, res) => {
         <tbody>${lines || '<tr><td colspan="5">No messages yet</td></tr>'}</tbody></table>
       `;
       res.type('html').send(adminPageShell(`${redisEnabled ? 'Redis' : 'In-memory'} Threads`, bodyHtml));
-      return;
-    }
+    return;
+  }
 
-    res.json({
-      count: rows.length,
-      subscribers: rows,
+  res.json({
+    count: rows.length,
+    subscribers: rows,
       hint: 'GET /messages/:botId/:subscriber_id for full thread; ?bot=esma to filter; ?format=html for UI'
     });
   } catch (err) {
@@ -2511,8 +2511,8 @@ async function startServer() {
 
   startPendingWorker();
 
-  app.listen(PORT, () => {
-    console.log(`\n🟢 Webhook server running on http://localhost:${PORT}`);
+app.listen(PORT, () => {
+  console.log(`\n🟢 Webhook server running on http://localhost:${PORT}`);
     for (const botId of listBotIds()) {
       const b = BOTS[botId];
       const keyOk = !!b.uchatApiKey;
@@ -2520,10 +2520,10 @@ async function startServer() {
     }
     console.log(`   POST /webhook                ← legacy alias → ${DEFAULT_BOT_ID}`);
     console.log(`   GET  /                       ← Health check`);
-    console.log(
+  console.log(
       `   GET  /messages?format=html   ← View ${redisEnabled ? 'Redis-backed' : 'in-memory'} Grok threads${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
-    );
-    console.log(
+  );
+  console.log(
       `   GET  /triggers?format=html   ← Dolazni POST /webhook${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
     );
     console.log(
