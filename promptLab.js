@@ -81,6 +81,10 @@ function createPromptLab(deps) {
     return source.name || source.id;
   }
 
+  function formatModeLabel(mode) {
+    return mode === 'replay' ? 'Replay full conversation' : 'Next reply only';
+  }
+
   function promptSources(drafts) {
     const botSources = Object.values(BOTS).map((bot) => ({
       type: 'bot',
@@ -181,6 +185,25 @@ function createPromptLab(deps) {
       return;
     }
     abRunMemStore.set(run.id, run);
+  }
+
+  async function loadAbRun(id) {
+    if (isRedisEnabled()) return readObject(abRunKey(id));
+    return abRunMemStore.get(id) || null;
+  }
+
+  async function listAbRuns(limit = 25) {
+    let rows;
+    if (isRedisEnabled()) {
+      const ids = await redisClient.sMembers(abRunsIndexKey());
+      rows = await Promise.all(ids.map(loadAbRun));
+    } else {
+      rows = [...abRunMemStore.values()];
+    }
+    return rows
+      .filter(Boolean)
+      .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+      .slice(0, limit);
   }
 
   async function getActivePrompt(botId) {
@@ -344,6 +367,29 @@ function createPromptLab(deps) {
     };
   }
 
+  async function createFixtureFromConversation(botId, subscriberId, name) {
+    const bot = getBot(botId);
+    if (!bot) throw new Error(`Unknown bot "${botId}"`);
+    const messages = await loadConversation(bot.id, subscriberId);
+    if (!messages) throw new Error(`Unknown conversation "${bot.id}/${subscriberId}"`);
+    const meta = await loadSubscriberMeta(bot.id, subscriberId);
+    const fixture = {
+      id: makeId('fix'),
+      name: toCleanString(name) || `${bot.displayName} ${subscriberDisplay(meta, subscriberId)} ${new Date().toLocaleDateString('en-GB')}`,
+      botId: bot.id,
+      subscriberId,
+      capturedAt: nowIso(),
+      messages: messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+        ...(m.imageUrl ? { imageUrl: m.imageUrl } : {})
+      })),
+      meta
+    };
+    await saveFixture(fixture);
+    return fixture;
+  }
+
   async function collectLiveConversationOptions() {
     const rows = [];
     for (const botId of listBotIds()) {
@@ -357,12 +403,15 @@ function createPromptLab(deps) {
         rows.push({
           botId,
           subscriberId: id,
+          messageCount: nonSys.length,
+          lastRole: last?.role || '',
+          lastAt: last?.createdAt || last?.ts || last?.time || '',
           label: `${bot?.displayName || botId} / ${subscriberDisplay(meta, id)} (${nonSys.length} msgs)`,
           preview: last?.content ? String(last.content).slice(0, 90) : ''
         });
       }
     }
-    return rows;
+    return rows.sort((a, b) => String(b.lastAt).localeCompare(String(a.lastAt)));
   }
 
   function subscriberDisplay(meta, fallbackId) {
@@ -382,27 +431,95 @@ function createPromptLab(deps) {
     return `<select name="${escHtml(name)}" required>${options}</select>`;
   }
 
-  function renderRunColumn(title, source, result) {
-    const turns = result.turns || [];
-    const rows = turns
-      .map((turn) => `
-        <div class="card">
-          <div class="muted">Turn ${turn.turn} · context messages: ${turn.contextCount}</div>
-          <p><strong>User</strong></p>
-          <pre>${escHtml(turn.user || '')}</pre>
-          <p><strong>${escHtml(title)}</strong></p>
-          <pre>${escHtml(turn.reply || '')}</pre>
-        </div>`)
+  function renderConversationHiddenInputs(conversation) {
+    if (conversation.kind === 'fixture') {
+      return `<input type="hidden" name="fixtureId" value="${escHtml(conversation.id)}">`;
+    }
+    return `
+      <input type="hidden" name="botId" value="${escHtml(conversation.botId)}">
+      <input type="hidden" name="subscriberId" value="${escHtml(conversation.subscriberId)}">
+    `;
+  }
+
+  function testUrlForConversation(conversation, extra = '', includeToken = true) {
+    const suffix = `${extra}${includeToken ? tokenQuerySuffix() : ''}`;
+    if (conversation.kind === 'fixture') {
+      return `/prompt-lab/test?format=html&fixtureId=${encodeURIComponent(conversation.id)}${suffix}`;
+    }
+    return `/prompt-lab/test?format=html&botId=${encodeURIComponent(conversation.botId)}&subscriberId=${encodeURIComponent(conversation.subscriberId)}${suffix}`;
+  }
+
+  function renderTranscript(messages, maxMessages = 18) {
+    const visible = nonSystemMessages(messages).slice(-maxMessages);
+    return visible
+      .map((message) => {
+        const imageHtml = message.imageUrl
+          ? `<div style="margin-top:.5rem"><a href="${escHtml(message.imageUrl)}" target="_blank" rel="noreferrer">open image</a></div>`
+          : '';
+        return `<div class="bubble ${escHtml(message.role || '')}">
+          <strong>${escHtml(message.role || '')}</strong>
+          <pre>${escHtml(message.content || '')}</pre>
+          ${imageHtml}
+        </div>`;
+      })
       .join('');
-    return `<div class="card" style="flex:1 1 320px">
-      <h2>${escHtml(title)}</h2>
-      <p class="muted">${escHtml(formatPromptLabel(source))}</p>
-      ${rows || '<p class="muted">No generated turns.</p>'}
-    </div>`;
+  }
+
+  function renderCompareResults(run) {
+    const turnsA = Array.isArray(run.resultA) ? run.resultA : [];
+    const turnsB = Array.isArray(run.resultB) ? run.resultB : [];
+    const max = Math.max(turnsA.length, turnsB.length);
+    const rows = [];
+    for (let i = 0; i < max; i++) {
+      const a = turnsA[i] || {};
+      const b = turnsB[i] || {};
+      const user = a.user || b.user || '';
+      const contextCount = a.contextCount || b.contextCount || 0;
+      rows.push(`
+        <div class="card">
+          <div class="muted">Turn ${i + 1} · context messages: ${contextCount}</div>
+          <p><strong>User</strong></p>
+          <pre>${escHtml(user)}</pre>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:.75rem">
+            <div>
+              <p><strong>Prompt A</strong> <span class="muted">${escHtml(run.promptA?.name || '')}</span></p>
+              <pre>${escHtml(a.reply || '')}</pre>
+            </div>
+            <div>
+              <p><strong>Prompt B</strong> <span class="muted">${escHtml(run.promptB?.name || '')}</span></p>
+              <pre>${escHtml(b.reply || '')}</pre>
+            </div>
+          </div>
+        </div>`);
+    }
+    return rows.join('') || '<p class="muted">No generated turns.</p>';
+  }
+
+  function renderAbRunPage(run) {
+    const tokenQ = tokenQuerySuffix();
+    const conversation = run.conversation || {};
+    return `
+      <div class="actions">
+        <a class="button" href="/prompt-lab?format=html${tokenQ}">Prompt Lab</a>
+        <a class="button" href="/prompt-lab/runs?format=html${tokenQ}">Run history</a>
+        <a class="button" href="/prompt-lab/ab?format=html${tokenQ}">Run another</a>
+      </div>
+      <div class="card">
+        <p><strong>Conversation:</strong> ${escHtml(conversation.label || conversation.id || '')} <span class="pill">${escHtml(conversation.kind || '')}</span></p>
+        <p><strong>Mode:</strong> ${escHtml(formatModeLabel(run.mode))} · <strong>Run:</strong> <code>${escHtml(run.id || '')}</code> · <strong>Created:</strong> ${escHtml(run.createdAt || '')}</p>
+        <p><strong>Prompt A:</strong> ${escHtml(run.promptA?.name || '')} · <strong>Prompt B:</strong> ${escHtml(run.promptB?.name || '')}</p>
+      </div>
+      ${renderCompareResults(run)}
+    `;
   }
 
   async function renderPromptLabHome(req, res) {
-    const [drafts, fixtures] = await Promise.all([listDrafts(), listFixtures()]);
+    const [drafts, fixtures, liveOptions, runs] = await Promise.all([
+      listDrafts(),
+      listFixtures(),
+      collectLiveConversationOptions(),
+      listAbRuns(8)
+    ]);
     const activeByBot = {};
     for (const botId of listBotIds()) {
       activeByBot[botId] = await getActivePrompt(botId);
@@ -412,6 +529,8 @@ function createPromptLab(deps) {
       return res.json({
         drafts,
         fixtures,
+        live_conversations: liveOptions,
+        runs,
         active: activeByBot,
         variants: Object.keys(variants || {})
       });
@@ -454,6 +573,29 @@ function createPromptLab(deps) {
       })
       .join('');
 
+    const liveRows = liveOptions
+      .slice(0, 15)
+      .map((row) => {
+        const label = row.label || `${row.botId} / ${row.subscriberId}`;
+        return `<tr>
+          <td><span class="pill">${escHtml(row.botId)}</span></td>
+          <td>${escHtml(label)}</td>
+          <td>${escHtml(String(row.messageCount || ''))}</td>
+          <td>${escHtml(row.preview || '')}</td>
+          <td>
+            <a class="button" href="/prompt-lab/test?format=html&botId=${encodeURIComponent(row.botId)}&subscriberId=${encodeURIComponent(row.subscriberId)}${tokenQ}">Test</a>
+            <form method="post" action="${postAction('/prompt-lab/fixtures/from-conversation')}" style="display:inline">
+              <input type="hidden" name="botId" value="${escHtml(row.botId)}">
+              <input type="hidden" name="subscriberId" value="${escHtml(row.subscriberId)}">
+              <input type="hidden" name="name" value="${escHtml(label)}">
+              <input type="hidden" name="returnTo" value="/prompt-lab?format=html">
+              <button class="button" type="submit">Save fixture</button>
+            </form>
+          </td>
+        </tr>`;
+      })
+      .join('');
+
     const draftRows = drafts
       .map((draft) => `<tr>
         <td><code>${escHtml(draft.id)}</code></td>
@@ -474,20 +616,33 @@ function createPromptLab(deps) {
         <td>${renderSubscriberCell(fixture.meta, fixture.subscriberId)}</td>
         <td>${(fixture.messages || []).filter((m) => m.role !== 'system').length}</td>
         <td>${escHtml(fixture.capturedAt || '')}</td>
+        <td><a class="button" href="/prompt-lab/test?format=html&fixtureId=${encodeURIComponent(fixture.id)}${tokenQ}">Test</a></td>
+      </tr>`)
+      .join('');
+
+    const runRows = runs
+      .map((run) => `<tr>
+        <td>${escHtml(run.createdAt || '')}</td>
+        <td>${escHtml(run.conversation?.label || run.conversation?.id || '')}</td>
+        <td><span class="pill">${escHtml(run.conversation?.botId || '')}</span></td>
+        <td>${escHtml(run.promptA?.name || '')}</td>
+        <td>${escHtml(run.promptB?.name || '')}</td>
+        <td>${escHtml(formatModeLabel(run.mode))}</td>
+        <td><a href="/prompt-lab/runs/${encodeURIComponent(run.id)}?format=html${tokenQ}">open</a></td>
       </tr>`)
       .join('');
 
     const body = `
-      <p class="muted">Simple flow: save a real conversation, make a prompt draft, then compare two prompts before touching production.</p>
+      <p class="muted">Pick a real conversation, see the bot/persona, then compare current production against a draft before touching live replies.</p>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:.75rem;margin:1rem 0">
         <div class="card">
-          <h2>1. Save a conversation</h2>
-          <p>Open any thread and click <strong>Save as test fixture</strong>. That locks a real chat for testing.</p>
-          <a class="button" href="/conversations?format=html${tokenQ}">Open conversations</a>
+          <h2>1. Choose conversation</h2>
+          <p>Use a live/local conversation for quick checks, or save it as a stable test fixture.</p>
+          <a class="button" href="#recent-conversations">Recent conversations</a>
         </div>
         <div class="card">
-          <h2>2. Make a prompt draft</h2>
-          <p>Start from the current production prompt, then edit it safely without changing live replies.</p>
+          <h2>2. Make prompt draft</h2>
+          <p>Start from the selected bot's current production prompt, then edit safely in Redis.</p>
           <form method="post" action="${postAction('/prompt-lab/drafts/clone')}">
             <input type="hidden" name="sourceType" value="bot">
             <select name="sourceId">${Object.values(BOTS).map((bot) => `<option value="${escHtml(bot.id)}">${escHtml(bot.displayName)} current prompt</option>`).join('')}</select>
@@ -495,11 +650,21 @@ function createPromptLab(deps) {
           </form>
         </div>
         <div class="card">
-          <h2>3. Compare A/B</h2>
-          <p>Pick one saved conversation and compare two prompts side-by-side.</p>
+          <h2>3. Compare side by side</h2>
+          <p>Open a conversation test workspace and compare production vs draft turn by turn.</p>
           <a class="button" href="/prompt-lab/ab?format=html${tokenQ}">Compare prompts</a>
         </div>
       </div>
+
+      <h2 id="recent-conversations">Recent conversations</h2>
+      <table><thead><tr><th>Bot</th><th>Person</th><th>Msgs</th><th>Last message</th><th>Actions</th></tr></thead><tbody>${liveRows || '<tr><td colspan="5" class="muted">No live conversations found yet.</td></tr>'}</tbody></table>
+
+      <h2>Saved test conversations</h2>
+      <table><thead><tr><th>Name</th><th>Bot</th><th>User</th><th>Msgs</th><th>Captured</th><th></th></tr></thead><tbody>${fixtureRows || '<tr><td colspan="6" class="muted">No fixtures saved yet.</td></tr>'}</tbody></table>
+
+      <h2>Recent A/B runs</h2>
+      <table><thead><tr><th>Created</th><th>Conversation</th><th>Bot</th><th>Prompt A</th><th>Prompt B</th><th>Mode</th><th></th></tr></thead><tbody>${runRows || '<tr><td colspan="7" class="muted">No prompt comparisons yet.</td></tr>'}</tbody></table>
+      <p><a class="button" href="/prompt-lab/runs?format=html${tokenQ}">Open full run history</a></p>
 
       <details class="card">
         <summary><strong>Advanced: create a blank prompt draft</strong></summary>
@@ -517,9 +682,6 @@ function createPromptLab(deps) {
       <h2>Drafts</h2>
       <table><thead><tr><th>ID</th><th>Name</th><th>Bot</th><th>Base</th><th>Updated</th><th>Preview</th><th></th></tr></thead><tbody>${draftRows || '<tr><td colspan="7" class="muted">No drafts yet.</td></tr>'}</tbody></table>
 
-      <h2>Recent fixtures</h2>
-      <table><thead><tr><th>Name</th><th>Bot</th><th>User</th><th>Msgs</th><th>Captured</th></tr></thead><tbody>${fixtureRows || '<tr><td colspan="5" class="muted">No fixtures saved yet.</td></tr>'}</tbody></table>
-
       <details class="card">
         <summary><strong>Advanced: clone old JS variants</strong></summary>
         <table><thead><tr><th>Variant</th><th>Preview</th><th></th></tr></thead><tbody>${variantRows || '<tr><td colspan="3" class="muted">No variants.</td></tr>'}</tbody></table>
@@ -528,12 +690,89 @@ function createPromptLab(deps) {
     return res.type('html').send(adminPageShell(htmlPageTitle(), body));
   }
 
+  async function renderPromptLabTest(req, res) {
+    const [drafts, conversation] = await Promise.all([listDrafts(), loadConversationSource(req)]);
+    const sources = promptSources(drafts);
+    const bot = getBot(conversation.botId);
+    const matchingDraft = drafts.find((draft) => !draft.botId || draft.botId === conversation.botId);
+    const selectedA = toCleanString(req.query.promptA) || `bot:${conversation.botId}`;
+    const selectedB = toCleanString(req.query.promptB) || (matchingDraft ? `draft:${matchingDraft.id}` : `bot:${conversation.botId}`);
+    const tokenQ = tokenQuerySuffix();
+    const msgCount = nonSystemMessages(conversation.messages).length;
+    const returnTo = testUrlForConversation(conversation, '', false);
+    const fixtureAction = conversation.kind === 'live'
+      ? `<form method="post" action="${postAction('/prompt-lab/fixtures/from-conversation')}" style="display:inline">
+          <input type="hidden" name="botId" value="${escHtml(conversation.botId)}">
+          <input type="hidden" name="subscriberId" value="${escHtml(conversation.subscriberId)}">
+          <input type="hidden" name="name" value="${escHtml(conversation.label)}">
+          <input type="hidden" name="returnTo" value="${escHtml(returnTo)}">
+          <button class="button" type="submit">Save stable fixture</button>
+        </form>`
+      : '<span class="pill">saved fixture</span>';
+
+    if (!wantsHtmlResponse(req)) {
+      return res.json({
+        conversation: { ...conversation, messages: undefined, message_count: msgCount },
+        prompt_sources: sources.map(({ body, ...rest }) => rest)
+      });
+    }
+
+    const body = `
+      <div class="actions">
+        <a class="button" href="/prompt-lab?format=html${tokenQ}">Prompt Lab</a>
+        <a class="button" href="/prompt-lab/runs?format=html${tokenQ}">Run history</a>
+        ${fixtureAction}
+      </div>
+      <div class="card">
+        <p><strong>Person:</strong> ${renderSubscriberCell(conversation.meta, conversation.subscriberId)}</p>
+        <p><strong>Bot/persona:</strong> ${escHtml(bot?.displayName || conversation.botId)} <span class="pill">${escHtml(conversation.botId)}</span></p>
+        <p><strong>Source:</strong> ${escHtml(conversation.kind)} · <strong>Messages:</strong> ${msgCount} · <strong>Current prompt:</strong> ${escHtml(bot?.displayName || conversation.botId)} production</p>
+      </div>
+
+      <div style="display:grid;grid-template-columns:minmax(280px,1fr) minmax(320px,1fr);gap:1rem;align-items:start">
+        <div class="card">
+          <h2>Conversation preview</h2>
+          <p class="muted">Showing the latest messages used as prompt context.</p>
+          <div class="thread">${renderTranscript(conversation.messages) || '<p class="muted">No messages yet.</p>'}</div>
+        </div>
+        <div class="card">
+          <h2>Compare prompts</h2>
+          <form method="post" action="${postAction('/prompt-lab/ab-test')}">
+            ${renderConversationHiddenInputs(conversation)}
+            <p><label>Prompt A<br>${renderPromptSelect('promptA', sources, selectedA)}</label></p>
+            <p><label>Prompt B<br>${renderPromptSelect('promptB', sources, selectedB)}</label></p>
+            <p><label>Test type<br><select name="mode"><option value="last">Next reply only</option><option value="replay">Replay full conversation</option></select></label></p>
+            <button class="button" type="submit">Compare side by side</button>
+          </form>
+          <hr>
+          <form method="post" action="${postAction('/prompt-lab/drafts/clone')}">
+            <input type="hidden" name="sourceType" value="bot">
+            <input type="hidden" name="sourceId" value="${escHtml(conversation.botId)}">
+            <input type="hidden" name="returnTo" value="${escHtml(returnTo)}">
+            <button class="button" type="submit">Create draft from this bot prompt</button>
+          </form>
+        </div>
+      </div>
+    `;
+    return res.type('html').send(adminPageShell(htmlPageTitle('Test Conversation'), body));
+  }
+
   app.get('/prompt-lab', async (req, res) => {
     if (!assertViewMessagesAuth(req, res)) return;
     try {
       await renderPromptLabHome(req, res);
     } catch (err) {
       console.error('❌ /prompt-lab error:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/prompt-lab/test', async (req, res) => {
+    if (!assertViewMessagesAuth(req, res)) return;
+    try {
+      await renderPromptLabTest(req, res);
+    } catch (err) {
+      console.error('❌ /prompt-lab/test error:', err.message);
       res.status(500).json({ error: err.message });
     }
   });
@@ -552,6 +791,7 @@ function createPromptLab(deps) {
         <td>${renderSubscriberCell(fixture.meta, fixture.subscriberId)}</td>
         <td>${(fixture.messages || []).filter((m) => m.role !== 'system').length}</td>
         <td>${escHtml(fixture.capturedAt || '')}</td>
+        <td><a class="button" href="/prompt-lab/test?format=html&fixtureId=${encodeURIComponent(fixture.id)}${tokenQ}">Test</a></td>
       </tr>`)
       .join('');
     const body = `
@@ -561,7 +801,7 @@ function createPromptLab(deps) {
         <a class="button" href="/prompt-lab/fixtures?format=json${tokenQ}">JSON</a>
       </div>
       <p class="muted">Fixtures are frozen snapshots of real conversations for repeatable prompt testing.</p>
-      <table><thead><tr><th>Name</th><th>ID</th><th>Bot</th><th>User</th><th>Msgs</th><th>Captured</th></tr></thead><tbody>${rows || '<tr><td colspan="6" class="muted">No fixtures yet. Open a thread and click Save as test fixture.</td></tr>'}</tbody></table>
+      <table><thead><tr><th>Name</th><th>ID</th><th>Bot</th><th>User</th><th>Msgs</th><th>Captured</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="7" class="muted">No fixtures yet. Open a thread and click Save as test fixture.</td></tr>'}</tbody></table>
     `;
     res.type('html').send(adminPageShell(htmlPageTitle('Fixtures'), body));
   });
@@ -571,26 +811,8 @@ function createPromptLab(deps) {
     try {
       const botId = toCleanString(req.body.botId);
       const subscriberId = toCleanString(req.body.subscriberId);
-      const bot = getBot(botId);
-      if (!bot) return res.status(404).json({ error: 'Unknown bot id', botId });
-      const messages = await loadConversation(bot.id, subscriberId);
-      if (!messages) return res.status(404).json({ error: 'Unknown conversation', botId: bot.id, subscriberId });
-      const meta = await loadSubscriberMeta(bot.id, subscriberId);
-      const fixture = {
-        id: makeId('fix'),
-        name: toCleanString(req.body.name) || `${bot.displayName} ${subscriberDisplay(meta, subscriberId)} ${new Date().toLocaleDateString('en-GB')}`,
-        botId: bot.id,
-        subscriberId,
-        capturedAt: nowIso(),
-        messages: messages.map((m) => ({
-          role: m.role,
-          content: m.content,
-          ...(m.imageUrl ? { imageUrl: m.imageUrl } : {})
-        })),
-        meta
-      };
-      await saveFixture(fixture);
-      if (wantsHtmlResponse(req)) return redirectHtml(res, '/prompt-lab/fixtures?format=html');
+      const fixture = await createFixtureFromConversation(botId, subscriberId, req.body.name);
+      if (wantsHtmlResponse(req)) return redirectHtml(res, toCleanString(req.body.returnTo) || '/prompt-lab/fixtures?format=html');
       res.status(201).json({ status: 'ok', fixture });
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -629,6 +851,11 @@ function createPromptLab(deps) {
       updatedAt: nowIso()
     };
     await saveDraft(draft);
+    const returnTo = toCleanString(req.body.returnTo);
+    if (wantsHtmlResponse(req) && returnTo.startsWith('/prompt-lab/')) {
+      const sep = returnTo.includes('?') ? '&' : '?';
+      return redirectHtml(res, `${returnTo}${sep}promptB=draft:${encodeURIComponent(draft.id)}`);
+    }
     if (wantsHtmlResponse(req)) return redirectHtml(res, `/prompt-lab/edit/${encodeURIComponent(draft.id)}?format=html`);
     res.status(201).json({ status: 'ok', draft });
   });
@@ -731,7 +958,7 @@ function createPromptLab(deps) {
         <p><label>Prompt A (usually current production)<br>${renderPromptSelect('promptA', sources, req.query.promptA)}</label></p>
         <p><label>Prompt B (your new draft)<br>${renderPromptSelect('promptB', sources, req.query.promptB)}</label></p>
         <h2>3. Choose test type</h2>
-        <p><label>Test type<br><select name="mode"><option value="last">Quick test: only next reply</option><option value="replay">Deep test: replay every user message</option></select></label></p>
+        <p><label>Test type<br><select name="mode"><option value="last">Next reply only</option><option value="replay">Replay full conversation</option></select></label></p>
         <button class="button" type="submit">Compare prompts</button>
       </form>
     `;
@@ -778,26 +1005,50 @@ function createPromptLab(deps) {
 
       if (!wantsHtmlResponse(req)) return res.json({ status: 'ok', run });
 
-      const tokenQ = tokenQuerySuffix();
-      const body = `
-        <div class="actions">
-          <a class="button" href="/prompt-lab/ab?format=html${tokenQ}">Run another</a>
-          <a class="button" href="/prompt-lab?format=html${tokenQ}">Prompt Lab</a>
-        </div>
-        <div class="card">
-          <p><strong>Conversation:</strong> ${escHtml(conversation.label)} <span class="pill">${escHtml(conversation.kind)}</span></p>
-          <p><strong>Mode:</strong> ${escHtml(mode)} · <strong>Run:</strong> <code>${escHtml(run.id)}</code></p>
-        </div>
-        <div style="display:flex;gap:1rem;align-items:flex-start;flex-wrap:wrap">
-          ${renderRunColumn('Prompt A', sourceA, { turns: resultA })}
-          ${renderRunColumn('Prompt B', sourceB, { turns: resultB })}
-        </div>
-      `;
+      const body = renderAbRunPage(run);
       res.type('html').send(adminPageShell(htmlPageTitle('A/B Result'), body));
     } catch (err) {
       console.error('❌ /prompt-lab/ab-test error:', err.response?.data || err.message);
       res.status(500).json({ error: err.message, detail: err.response?.data || null });
     }
+  });
+
+  app.get('/prompt-lab/runs', async (req, res) => {
+    if (!assertViewMessagesAuth(req, res)) return;
+    const limit = Math.min(parseInt(req.query.limit || '50', 10) || 50, 200);
+    const runs = await listAbRuns(limit);
+    if (!wantsHtmlResponse(req)) return res.json({ count: runs.length, runs });
+
+    const tokenQ = tokenQuerySuffix();
+    const rows = runs
+      .map((run) => `<tr>
+        <td>${escHtml(run.createdAt || '')}</td>
+        <td><code>${escHtml(run.id || '')}</code></td>
+        <td>${escHtml(run.conversation?.label || run.conversation?.id || '')}</td>
+        <td><span class="pill">${escHtml(run.conversation?.botId || '')}</span></td>
+        <td>${escHtml(run.promptA?.name || '')}</td>
+        <td>${escHtml(run.promptB?.name || '')}</td>
+        <td>${escHtml(formatModeLabel(run.mode))}</td>
+        <td><a href="/prompt-lab/runs/${encodeURIComponent(run.id)}?format=html${tokenQ}">open</a></td>
+      </tr>`)
+      .join('');
+    const body = `
+      <div class="actions">
+        <a class="button" href="/prompt-lab?format=html${tokenQ}">Prompt Lab</a>
+        <a class="button" href="/prompt-lab/ab?format=html${tokenQ}">Run comparison</a>
+      </div>
+      <p class="muted">Saved prompt comparisons, newest first.</p>
+      <table><thead><tr><th>Created</th><th>ID</th><th>Conversation</th><th>Bot</th><th>Prompt A</th><th>Prompt B</th><th>Mode</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="8" class="muted">No runs saved yet.</td></tr>'}</tbody></table>
+    `;
+    res.type('html').send(adminPageShell(htmlPageTitle('Run History'), body));
+  });
+
+  app.get('/prompt-lab/runs/:runId', async (req, res) => {
+    if (!assertViewMessagesAuth(req, res)) return;
+    const run = await loadAbRun(req.params.runId);
+    if (!run) return res.status(404).json({ error: 'Unknown run', runId: req.params.runId });
+    if (!wantsHtmlResponse(req)) return res.json({ run });
+    res.type('html').send(adminPageShell(htmlPageTitle('Saved A/B Result'), renderAbRunPage(run)));
   });
 
   app.post('/prompt-lab/promote', async (req, res) => {

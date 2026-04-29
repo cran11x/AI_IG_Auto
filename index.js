@@ -368,7 +368,8 @@ function normalizeUchatLiveChatMessages(rawMessages, limit) {
         type: m.type ?? null,
         msg_type: m.msg_type ?? null,
         sender_id: m.sender_id ?? null,
-        ts: m.ts ?? null
+        ts: m.ts ?? null,
+        delivery_status: getUchatDeliveryStatus(m).summary
       }
     });
   }
@@ -479,6 +480,45 @@ function getUchatMessageTime(message) {
   return null;
 }
 
+function collectUchatStatusValues(value, out = []) {
+  if (!value || out.length > 40) return out;
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return out;
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectUchatStatusValues(item, out));
+    return out;
+  }
+  if (typeof value === 'object') {
+    for (const [key, child] of Object.entries(value)) {
+      const keyLower = String(key).toLowerCase();
+      if (
+        keyLower.includes('status') ||
+        keyLower.includes('error') ||
+        keyLower.includes('fail') ||
+        keyLower.includes('reason')
+      ) {
+        if (child != null && typeof child !== 'object') out.push(`${key}:${String(child)}`);
+        else if (child != null) out.push(`${key}:${rawJsonPreview(child, 160)}`);
+      }
+      if (child && typeof child === 'object') collectUchatStatusValues(child, out);
+    }
+  }
+  return out;
+}
+
+function getUchatDeliveryStatus(message) {
+  const values = collectUchatStatusValues(message);
+  const joined = values.join(' | ');
+  const lower = joined.toLowerCase();
+  const failed = /\b(fail|failed|error|undeliver|not delivered|rejected|blocked|disconnect|disconnected)\b/.test(lower);
+  const sent = /\b(delivered|sent|success|succeeded|ok)\b/.test(lower) && !failed;
+  return {
+    failed,
+    sent,
+    values,
+    summary: joined || null
+  };
+}
+
 function looksLikeImageUrl(value) {
   const s = String(value || '').trim();
   if (!/^https?:\/\//i.test(s)) return false;
@@ -536,7 +576,8 @@ async function uchatHasAssistantText(bot, subscriberId, text, limit = 50) {
   const outbound = outboundMessages
     .map((message) => ({
       text: getUchatMessageText(message),
-      createdAt: getUchatMessageTime(message)
+      createdAt: getUchatMessageTime(message),
+      delivery: getUchatDeliveryStatus(message)
     }))
     .filter((item) => item.text);
   const outboundTexts = outbound.map((item) => item.text);
@@ -549,10 +590,13 @@ async function uchatHasAssistantText(bot, subscriberId, text, limit = 50) {
 
   const fullIdx = normalizedOutbound.findIndex((out) => out === normalizedFull);
   if (fullIdx >= 0) {
+    const matched = outbound[fullIdx];
     return {
       delivered: true,
+      failed: !!matched.delivery?.failed,
       matchedText: outboundTexts[fullIdx],
-      matchedAt: outbound[fullIdx]?.createdAt || null,
+      matchedAt: matched.createdAt || null,
+      deliveryStatus: matched.delivery?.summary || null,
       rawCount: raw.length
     };
   }
@@ -560,11 +604,20 @@ async function uchatHasAssistantText(bot, subscriberId, text, limit = 50) {
   for (let start = 0; start < normalizedOutbound.length; start++) {
     let joined = '';
     const matchedParts = [];
+    const matchedDelivery = [];
     for (let end = start; end < Math.min(normalizedOutbound.length, start + 6); end++) {
       joined = normalizeDeliveryText([joined, normalizedOutbound[end]].filter(Boolean).join(' '));
       matchedParts.push(outboundTexts[end]);
+      matchedDelivery.push(outbound[end]?.delivery);
       if (joined === normalizedFull) {
-        return { delivered: true, matchedText: matchedParts.join('\n'), rawCount: raw.length };
+        const failed = matchedDelivery.some((delivery) => delivery?.failed);
+        return {
+          delivered: true,
+          failed,
+          matchedText: matchedParts.join('\n'),
+          deliveryStatus: matchedDelivery.map((delivery) => delivery?.summary).filter(Boolean).join(' | ') || null,
+          rawCount: raw.length
+        };
       }
       if (joined.length > normalizedFull.length + 20) break;
     }
@@ -1340,7 +1393,7 @@ async function collectDeliveryCheckRows(filterBotId, maxConversations) {
           bot: bot.id,
           subscriber_id: id,
           meta,
-          status: delivery.delivered ? 'delivered' : 'missing',
+          status: delivery.failed ? 'failed' : (delivery.delivered ? 'delivered' : 'missing'),
           assistant_index: lastAssistant.index,
           assistant_preview: lastAssistant.content.slice(0, 220),
           local_created_at: lastAssistant.createdAt,
@@ -1348,6 +1401,7 @@ async function collectDeliveryCheckRows(filterBotId, maxConversations) {
           outbound_count: delivery.outboundCount ?? null,
           matched_preview: delivery.matchedText ? String(delivery.matchedText).slice(0, 220) : null,
           matched_at: delivery.matchedAt || null,
+          delivery_status: delivery.deliveryStatus || null,
           reason: delivery.reason || null
         });
       } catch (err) {
@@ -1826,6 +1880,7 @@ async function renderThread(req, res, botId, subscriberId) {
       <div class="actions">
         <a class="button" href="/messages?format=html${tokenQ}">All threads</a>
         <a class="button" href="/conversations?format=html&bot=${encodeURIComponent(bot.id)}${tokenQ}">${esc(bot.displayName)} conversations</a>
+        <a class="button" href="/prompt-lab/test?format=html&botId=${encodeURIComponent(bot.id)}&subscriberId=${encodeURIComponent(subscriberId)}${tokenQ}">Open in Prompt Lab</a>
         <form method="post" action="/prompt-lab/fixtures/from-conversation?format=html${tokenQ}" style="display:inline-flex;gap:.35rem;flex-wrap:wrap">
           <input type="hidden" name="botId" value="${esc(bot.id)}">
           <input type="hidden" name="subscriberId" value="${esc(subscriberId)}">
@@ -1897,10 +1952,12 @@ app.get('/delivery-check', async (req, res) => {
       .map((row) => {
         const statusHtml = row.status === 'missing'
           ? '<span class="bad">missing from UChat</span>'
+          : row.status === 'failed'
+            ? '<span class="bad">failed in UChat</span>'
           : row.status === 'delivered'
             ? '<span class="ok">seen in UChat</span>'
             : `<span class="pill">${escHtml(row.status)}</span>`;
-        const resendHtml = row.status === 'missing'
+        const resendHtml = row.status === 'missing' || row.status === 'failed'
           ? `<form method="post" action="/delivery-check/resend?format=html${tokenQ}" onsubmit="return confirm('Resend this saved assistant reply to UChat?')">
               <input type="hidden" name="botId" value="${escHtml(row.bot)}">
               <input type="hidden" name="subscriberId" value="${escHtml(row.subscriber_id)}">
@@ -1919,6 +1976,7 @@ app.get('/delivery-check', async (req, res) => {
         const detailParts = [];
         if (row.local_created_at) detailParts.push(`local: ${row.local_created_at}`);
         if (row.matched_at) detailParts.push(`uchat: ${row.matched_at}`);
+        if (row.delivery_status) detailParts.push(`status: ${row.delivery_status}`);
         if (row.error || row.reason) detailParts.push(row.error || row.reason);
         if (row.matched_preview) detailParts.push(`matched in UChat: ${row.matched_preview}`);
         const detail = detailParts.join(' · ');
@@ -1946,7 +2004,7 @@ app.get('/delivery-check', async (req, res) => {
       </form>
       <div class="card">
         <strong>Summary:</strong>
-        seen in UChat ${escHtml(counts.delivered || 0)} · missing from UChat ${escHtml(counts.missing || 0)} · errors ${escHtml(counts.error || 0)} · skipped ${escHtml(counts.skipped || 0)}
+        seen in UChat ${escHtml(counts.delivered || 0)} · failed in UChat ${escHtml(counts.failed || 0)} · missing from UChat ${escHtml(counts.missing || 0)} · errors ${escHtml(counts.error || 0)} · skipped ${escHtml(counts.skipped || 0)}
       </div>
       <table>
         <thead><tr><th>Bot</th><th>User</th><th>Status</th><th>Last assistant reply</th><th>Detail</th><th>Action</th></tr></thead>
@@ -1982,7 +2040,7 @@ app.post('/delivery-check/resend', async (req, res) => {
     }
 
     const delivery = await uchatHasAssistantText(bot, subscriberId, msg.content);
-    if (delivery.delivered && !force) {
+    if (delivery.delivered && !delivery.failed && !force) {
       pushTrigger({
         id: `${Date.now()}-delivery-skip-${Math.random().toString(36).slice(2, 9)}`,
         at: new Date().toISOString(),
