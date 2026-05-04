@@ -631,56 +631,42 @@ function lastNonSystemRole(messages) {
   return tail.length ? tail[tail.length - 1].role : undefined;
 }
 
-/** Split Grok reply into 1–3 short chunks for natural DM sending. */
+/**
+ * Natural DM-style send logic.
+ * Distribution per call: ~45% one message, ~35% two, ~20% three.
+ * Short replies always go as one message.
+ */
 function splitReplySmart(reply) {
   const text = String(reply || '').trim();
   if (!text) return [];
-  const maxParts = 4;
-  const maxLen = 135;
 
-  const mergeToParts = (chunks) => {
-    const trimmed = chunks.map((c) => String(c).trim()).filter(Boolean);
-    if (!trimmed.length) return [];
-    const out = [];
-    let buf = '';
-    for (const c of trimmed) {
-      if (!buf) buf = c;
-      else if (buf.length + 1 + c.length <= maxLen) buf += `\n${c}`;
-      else {
-        out.push(buf);
-        buf = c;
-      }
-    }
-    if (buf) out.push(buf);
+  const maxLen = 120;
 
-    // Blaga randomizacija: u ~30% slučajeva spoji zadnje dvije poruke ako nisu preduge, da varira broj poruka
-    if (out.length > 1 && Math.random() < 0.3) {
-      const last1 = out.pop();
-      const last2 = out.pop();
-      if (last1 && last2 && (last1.length + last2.length) < 160) {
-        out.push(`${last2}\n${last1}`);
-      } else {
-        if (last2) out.push(last2);
-        if (last1) out.push(last1);
-      }
-    }
+  const r = Math.random();
+  let target = 1;
+  if (r > 0.80) target = 3;
+  else if (r > 0.45) target = 2;
 
-    while (out.length > maxParts) {
-      out[out.length - 2] = `${out[out.length - 2]}\n${out.pop()}`;
-    }
-    return out.length ? out : [text];
-  };
+  if (target === 1 || text.length <= maxLen) {
+    return [text];
+  }
 
-  if (text.length <= maxLen) return [text];
+  const splitOnPara = text.split(/\n\n+/).map((s) => s.trim()).filter(Boolean);
+  let pieces = splitOnPara.length >= target
+    ? splitOnPara
+    : text.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
 
-  const para = text.split(/\n\n+/);
-  if (para.length >= 2) return mergeToParts(para);
+  if (pieces.length < target) {
+    return [text];
+  }
 
-  const sentences = text.split(/(?<=[.!?])\s+/);
-  if (sentences.length >= 2) return mergeToParts(sentences);
+  const groupSize = Math.ceil(pieces.length / target);
+  const chunks = [];
+  for (let i = 0; i < pieces.length; i += groupSize) {
+    chunks.push(pieces.slice(i, i + groupSize).join(' '));
+  }
 
-  const mid = Math.ceil(text.length / 2);
-  return mergeToParts([text.slice(0, mid), text.slice(mid)]);
+  return chunks.slice(0, target);
 }
 
 async function sendUchatText(bot, subscriberId, text) {
