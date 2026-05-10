@@ -37,6 +37,8 @@ function buildBots() {
   return bots;
 }
 
+const DEFAULT_BOT_ID = 'esma';
+
 let BOTS = buildBots();
 
 function getBot(botId) {
@@ -62,8 +64,6 @@ function setSaraEnabled(enabled) {
   saraEnabled = !!enabled;
   BOTS = buildBots();
 }
-
-const DEFAULT_BOT_ID = 'esma';
 
 module.exports = {
   BOTS,
