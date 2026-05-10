@@ -3,6 +3,8 @@ const express = require('express');
 const axios = require('axios');
 const { createClient } = require('redis');
 
+const { applyPitchTrackingToReply } = require('./pitchTracking');
+
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
@@ -37,14 +39,18 @@ const UCHAT_HISTORY_TIMEOUT_MS = (() => {
 /** If set, GET /messages* requires ?token=... or X-View-Token header (use when tunneling). */
 const VIEW_MESSAGES_TOKEN = process.env.VIEW_MESSAGES_TOKEN;
 
+/** Public URL of this app (no trailing slash). Used for /r/… pitch click tracking redirects. */
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || '').trim();
+
 // Max user+assistant turns kept (one optional system message is kept at index 0)
 const MAX_HISTORY = 20;
 
 // ── Bot config (Esma, Sara, …) ──────────────────────────────────────────────
-const { BOTS, DEFAULT_BOT_ID, getBot, listBotIds } = require('./prompts/bots');
+const { BOTS, DEFAULT_BOT_ID, getBot, listBotIds, isSaraEnabled, setSaraEnabled } = require('./prompts/bots');
 const { variants } = require('./prompts/variants');
 const { withTimeAwareMessages } = require('./prompts/timeContext');
 const { createPromptLab } = require('./promptLab');
+const { createChatAnalyzer } = require('./chatAnalyzer');
 let promptLab = null;
 
 // ── Conversation store (Redis primary; in-memory fallback) ───────────────────
@@ -81,6 +87,11 @@ const conversationKey = (botId, subscriberId) =>
 const conversationIndexKey = (botId) => `${REDIS_KEY_PREFIX}:${botId}:conversations`;
 const subscriberMetaKey = (botId, subscriberId) =>
   `${REDIS_KEY_PREFIX}:${botId}:subscriberMeta:${subscriberId}`;
+const pitchClickListKey = (botId, subscriberId) =>
+  `${REDIS_KEY_PREFIX}:${botId}:pitchClick:${subscriberId}`;
+
+/** @type {Map<string, object[]>} */
+const pitchClickMemStore = new Map();
 
 async function loadConversation(botId, subscriberId) {
   if (redisEnabled) {
@@ -156,6 +167,39 @@ async function saveSubscriberMeta(botId, subscriberId, meta) {
   subscriberMetaStore.set(memKey(botId, subscriberId), next);
 }
 
+async function logPitchClickEvent(botId, subscriberId, data) {
+  const line = JSON.stringify(data);
+  if (redisEnabled) {
+    const key = pitchClickListKey(botId, subscriberId);
+    await redisClient.rPush(key, line);
+    await redisClient.lTrim(key, -500, -1);
+    return;
+  }
+  const k = memKey(botId, subscriberId);
+  let arr = pitchClickMemStore.get(k) || [];
+  try {
+    arr = [...arr, JSON.parse(line)];
+  } catch {
+    arr.push({ raw: line, ts: new Date().toISOString() });
+  }
+  if (arr.length > 500) arr = arr.slice(-500);
+  pitchClickMemStore.set(k, arr);
+}
+
+async function listPitchClickEvents(botId, subscriberId) {
+  if (redisEnabled) {
+    const raw = await redisClient.lRange(pitchClickListKey(botId, subscriberId), 0, -1);
+    return raw.map((r) => {
+      try {
+        return JSON.parse(r);
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
+  }
+  return [...(pitchClickMemStore.get(memKey(botId, subscriberId)) || [])];
+}
+
 async function getEffectivePromptBody(bot) {
   if (!bot) return '';
   if (promptLab?.getEffectivePrompt) {
@@ -184,7 +228,15 @@ function buildNameLine(firstName, igUsername, existingMessages) {
 async function buildSystemPrompt(bot, firstName, igUsername, existingMessages) {
   const promptBody = await getEffectivePromptBody(bot);
   const nameLine = buildNameLine(firstName, igUsername, existingMessages);
-  return nameLine ? `${promptBody}\n${nameLine}` : promptBody;
+  let full = nameLine ? `${promptBody}\n${nameLine}` : promptBody;
+  if (String(promptBody).includes('CURRENT_EXCLUSIVE_LINK')) {
+    full += [
+      '',
+      'Output rule for the exclusive link: when you pitch, include the URL exactly as the literal text CURRENT_EXCLUSIVE_LINK (no other domain, no URL shorteners).',
+      'The system will replace that token with the real trackable link before the user sees it.'
+    ].join('\n');
+  }
+  return full;
 }
 
 async function syncConversationSystemPrompt(bot, subscriberId, messages) {
@@ -864,8 +916,15 @@ async function flushPending(botId, subscriberId) {
       return;
     }
 
-    const parts = splitReplySmart(reply);
-    const chunks = parts.length ? parts : [String(reply)];
+    const { content: replyOut, pitchMeta } = applyPitchTrackingToReply({
+      reply,
+      bot,
+      subscriberId,
+      publicBaseUrl: PUBLIC_BASE_URL
+    });
+
+    const parts = splitReplySmart(replyOut);
+    const chunks = parts.length ? parts : [String(replyOut)];
 
     const uchatApiKey = bot.uchatApiKey;
     if (uchatApiKey) {
@@ -893,7 +952,13 @@ async function flushPending(botId, subscriberId) {
     const fresh = await loadConversation(botId, subscriberId);
     if (countUserMessages(fresh) !== userSnap) return;
 
-    fresh.push({ role: 'assistant', content: reply, createdAt: new Date().toISOString() });
+    const assistantMsg = {
+      role: 'assistant',
+      content: replyOut,
+      createdAt: new Date().toISOString(),
+      ...(pitchMeta ? { pitch: pitchMeta } : {})
+    };
+    fresh.push(assistantMsg);
     trimHistory(fresh);
     await saveConversation(botId, subscriberId, fresh);
 
@@ -905,7 +970,8 @@ async function flushPending(botId, subscriberId) {
       outcome: 'flushed',
       bot: bot.id,
       subscriber_id: subscriberId,
-      reply_preview: String(reply).slice(0, 200)
+      reply_preview: String(replyOut).slice(0, 200),
+      pitch_id: pitchMeta?.pitchId || null
     });
 
     console.log(`✅ [${bot.id}/${subscriberId}] Flushed cluster (${chunks.length} UChat part(s))`);
@@ -1191,83 +1257,159 @@ function renderSubscriberCell(meta, subscriberId) {
 
 function adminPageShell(title, bodyHtml) {
   const tokenQ = tokenQuerySuffix();
+  const navItem = (href, label, isPrimary) =>
+    `<a class="${isPrimary ? 'primary' : 'secondary'}" href="${href}?format=html${tokenQ}">${escHtml(label)}</a>`;
+  const primaryNav = [
+    ['/admin', 'Admin'],
+    ['/conversations', 'Conversations'],
+    ['/prompt-lab', 'Prompt Lab'],
+    ['/analyzer', 'Analyzer']
+  ]
+    .map(([h, l]) => navItem(h, l, true))
+    .join('');
+  const secondaryNav = [
+    ['/bots', 'Bots'],
+    ['/pending', 'Pending'],
+    ['/messages', 'Threads'],
+    ['/triggers', 'Triggers'],
+    ['/history-imports', 'Imports'],
+    ['/delivery-check', 'Delivery'],
+    ['/live-chat-sync', 'Sync'],
+    ['/failed', 'Failed']
+  ]
+    .map(([h, l]) => navItem(h, l, false))
+    .join('');
+
   return `<!DOCTYPE html>
 <html lang="hr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escHtml(title)}</title>
 <style>
+  :root{
+    --bg:#f5f7fb;
+    --surface:#fff;
+    --surface-2:#fafbff;
+    --text:#0f172a;
+    --muted:#64748b;
+    --border:#e2e8f0;
+    --border-strong:#cbd5e1;
+    --accent:#2563eb;
+    --accent-soft:#dbeafe;
+    --ok:#15803d;
+    --bad:#b91c1c;
+    --warn:#b45309;
+    --shadow:0 1px 2px rgba(15,23,42,.04),0 1px 3px rgba(15,23,42,.06);
+  }
   *{box-sizing:border-box}
-  html{background:#f7f8fb}
-  body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0 auto;padding:1rem;max-width:1100px;color:#111827}
-  a{color:#1d4ed8}
-  h1{margin:.9rem 0 .35rem;font-size:clamp(1.45rem,6vw,2rem);line-height:1.1}
-  nav{position:sticky;top:0;z-index:10;display:flex;gap:.45rem;overflow-x:auto;padding:.65rem .2rem .7rem;margin:-1rem -1rem .8rem;background:rgba(247,248,251,.96);backdrop-filter:blur(8px);border-bottom:1px solid #e5e7eb}
-  nav a{flex:0 0 auto;display:inline-flex;align-items:center;min-height:38px;padding:.45rem .7rem;border:1px solid #dbe1ea;border-radius:999px;background:#fff;color:#111827;text-decoration:none;font-size:14px;font-weight:650;box-shadow:0 1px 2px rgba(16,24,40,.04)}
-  nav a:active{transform:translateY(1px)}
-  table{border-collapse:collapse;width:100%;min-width:720px;margin-top:.5rem;background:#fff}
-  th,td{border:1px solid #ccc;padding:.5rem;text-align:left;vertical-align:top;font-size:14px}
-  th{background:#f4f4f4}
-  code,pre{background:#f6f8fa;padding:2px 6px;border-radius:4px;font-size:12px}
-  pre{padding:.5rem;white-space:pre-wrap;word-break:break-word;max-width:100%;overflow-x:auto}
-  table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:12px;box-shadow:0 1px 3px rgba(16,24,40,.08)}
-  tbody,thead,tr{width:100%}
-  .muted{color:#666;font-size:12px}
-  .ok{color:#117a3a;font-weight:600}
-  .bad{color:#a00;font-weight:600}
-  .pill{display:inline-block;padding:1px 6px;border-radius:8px;background:#eef;font-size:12px}
-  .subscriber{display:flex;align-items:center;gap:.6rem;min-width:190px}
-  .avatar{width:38px;height:38px;border-radius:999px;object-fit:cover;border:1px solid #dbe1ea;background:#eef;flex:0 0 auto}
-  .avatar.placeholder{display:inline-flex;align-items:center;justify-content:center;font-weight:750;color:#475569}
-  .subscriber-main{font-weight:700}
-  .subscriber-sub{color:#666;font-size:12px;margin-top:1px}
-  .card{background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:.85rem;margin:.75rem 0;box-shadow:0 1px 3px rgba(16,24,40,.08)}
-  .actions{display:flex;gap:.5rem;flex-wrap:wrap;margin:.75rem 0}
-  .button{display:inline-flex;align-items:center;min-height:38px;padding:.45rem .75rem;border:1px solid #dbe1ea;border-radius:10px;background:#fff;color:#111827;text-decoration:none;font-weight:650}
-  .thread{display:flex;flex-direction:column;gap:.65rem;margin:1rem 0}
-  .bubble{max-width:min(92%,720px);padding:.75rem .85rem;border-radius:16px;border:1px solid #e5e7eb;box-shadow:0 1px 2px rgba(16,24,40,.05)}
-  .bubble.user{align-self:flex-start;background:#e8f4ff}
-  .bubble.assistant{align-self:flex-end;background:#f3f4f6}
-  .bubble.system{align-self:center;background:#fff8e1}
-  .bubble strong{display:block;margin-bottom:.35rem;font-size:12px;letter-spacing:.02em;text-transform:uppercase;color:#4b5563}
-  .bubble pre{margin:0;background:transparent;padding:0;font:inherit;white-space:pre-wrap;word-break:break-word}
+  html{background:var(--bg)}
+  body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;padding:0;color:var(--text);font-size:15px;line-height:1.5}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .layout{max-width:1180px;margin:0 auto;padding:1rem 1.25rem 3rem}
+  h1{margin:1rem 0 .25rem;font-size:clamp(1.4rem,4vw,1.85rem);line-height:1.15;letter-spacing:-.01em;font-weight:700}
+  h2{margin:1.5rem 0 .55rem;font-size:1.1rem;font-weight:650;letter-spacing:-.005em}
+  p{margin:.55rem 0}
+  hr{border:0;border-top:1px solid var(--border);margin:1rem 0}
+
+  .topbar{position:sticky;top:0;z-index:10;background:rgba(245,247,251,.92);backdrop-filter:blur(10px);border-bottom:1px solid var(--border);padding:.55rem 1.25rem .35rem;margin:0}
+  .topbar-inner{max-width:1180px;margin:0 auto}
+  .nav{display:flex;flex-wrap:wrap;gap:.35rem;align-items:center}
+  .nav a{display:inline-flex;align-items:center;height:34px;padding:0 .8rem;border-radius:8px;font-size:13px;font-weight:600;border:1px solid transparent;color:var(--muted);white-space:nowrap}
+  .nav a.primary{background:var(--surface);border-color:var(--border);color:var(--text)}
+  .nav a.primary:hover{border-color:var(--border-strong);text-decoration:none}
+  .nav a.secondary{color:var(--muted);font-weight:500;font-size:12.5px;height:30px;padding:0 .65rem}
+  .nav a.secondary:hover{color:var(--text);background:var(--surface);text-decoration:none}
+  .nav-divider{width:1px;height:20px;background:var(--border);margin:0 .35rem}
+
+  .grid{display:grid;gap:1rem}
+  .grid-2{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+  .grid-3{grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+  .grid-4{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1rem 1.1rem;box-shadow:var(--shadow)}
+  .card h2{margin:0 0 .5rem}
+  .card.muted-card{background:var(--surface-2)}
+
+  .stat{display:block;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:.85rem 1rem;text-decoration:none;color:inherit;box-shadow:var(--shadow);transition:border-color .12s,transform .12s}
+  .stat:hover{border-color:var(--border-strong);text-decoration:none;transform:translateY(-1px)}
+  .stat .label{font-size:11.5px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+  .stat .value{font-size:1.7rem;font-weight:700;letter-spacing:-.02em;line-height:1.05;margin-top:.15rem}
+  .stat .hint{font-size:12px;color:var(--muted);margin-top:.2rem}
+  .stat.danger .value{color:var(--bad)}
+  .stat.ok .value{color:var(--ok)}
+
+  table{border-collapse:separate;border-spacing:0;width:100%;background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden;box-shadow:var(--shadow);font-size:13.5px}
+  thead{background:var(--surface-2)}
+  th,td{padding:.6rem .75rem;text-align:left;vertical-align:top;border-bottom:1px solid var(--border)}
+  th{font-weight:650;font-size:12px;letter-spacing:.03em;text-transform:uppercase;color:var(--muted)}
+  tbody tr:last-child td{border-bottom:0}
+  tbody tr:hover{background:var(--surface-2)}
+  td.nowrap{white-space:nowrap}
+
+  code,pre{background:var(--surface-2);border:1px solid var(--border);border-radius:6px;font-size:12px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+  code{padding:1px 6px}
+  pre{padding:.6rem .75rem;white-space:pre-wrap;word-break:break-word;max-width:100%;overflow-x:auto;margin:.4rem 0}
+
+  .muted{color:var(--muted);font-size:12.5px}
+  .ok{color:var(--ok);font-weight:600}
+  .bad{color:var(--bad);font-weight:600}
+  .warn{color:var(--warn);font-weight:600}
+  .pill{display:inline-block;padding:1px 8px;border-radius:999px;background:var(--accent-soft);color:#1e40af;font-size:11.5px;font-weight:600;letter-spacing:.02em}
+
+  .subscriber{display:flex;align-items:center;gap:.6rem;min-width:180px}
+  .avatar{width:34px;height:34px;border-radius:999px;object-fit:cover;border:1px solid var(--border);background:var(--accent-soft);flex:0 0 auto}
+  .avatar.placeholder{display:inline-flex;align-items:center;justify-content:center;font-weight:700;color:#1e40af;font-size:13px}
+  .subscriber-main{font-weight:650;line-height:1.2}
+  .subscriber-sub{color:var(--muted);font-size:11.5px;margin-top:1px}
+
+  .actions{display:flex;gap:.45rem;flex-wrap:wrap;margin:.5rem 0}
+  .button{display:inline-flex;align-items:center;height:34px;padding:0 .85rem;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--text);text-decoration:none;font-weight:600;font-size:13px;cursor:pointer}
+  .button:hover{border-color:var(--border-strong);text-decoration:none}
+  .button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .button.primary:hover{filter:brightness(.95)}
+
+  .thread{display:flex;flex-direction:column;gap:.55rem;margin:.75rem 0}
+  .bubble{max-width:min(92%,720px);padding:.7rem .85rem;border-radius:14px;border:1px solid var(--border);background:var(--surface)}
+  .bubble.user{align-self:flex-start;background:#eff6ff;border-color:#bfdbfe}
+  .bubble.assistant{align-self:flex-end;background:var(--surface-2)}
+  .bubble.system{align-self:center;background:#fefce8;border-color:#fde68a}
+  .bubble strong{display:block;margin-bottom:.3rem;font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted)}
+  .bubble pre{margin:0;background:transparent;border:0;padding:0;font:inherit;white-space:pre-wrap;word-break:break-word}
+
   .stack{display:grid;gap:.75rem}
   .nowrap{white-space:nowrap}
-  @media (max-width:640px){
-    body{padding:.8rem;font-size:15px}
-    nav{margin:-.8rem -.8rem .75rem;padding:.6rem .75rem;flex-wrap:wrap;overflow-x:visible}
-    nav a{min-height:42px;padding:.55rem .78rem;font-size:13px;flex:1 1 auto;justify-content:center}
-    p{line-height:1.45}
-    code,pre{font-size:11px}
-    table{display:block;min-width:0;width:100%;overflow:visible;background:transparent;box-shadow:none;border-radius:0}
+  details summary{cursor:pointer;font-weight:600}
+
+  @media (max-width:720px){
+    .layout{padding:.85rem .85rem 3rem}
+    .topbar{padding:.5rem .85rem .3rem}
+    .nav a{font-size:12.5px;height:32px;padding:0 .65rem}
+    .nav a.secondary{font-size:12px;height:28px}
+    table{display:block;background:transparent;border:0;border-radius:0;box-shadow:none;font-size:13px}
     thead{display:none}
     tbody{display:block;width:100%}
-    tr{display:block;width:100%;margin:.75rem 0;padding:.15rem 0;background:#fff;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 1px 3px rgba(16,24,40,.08);overflow:hidden}
-    td{display:block;width:100%;border:0;border-bottom:1px solid #eef2f7;padding:.65rem .75rem;font-size:13px}
+    tr{display:block;width:100%;margin:.55rem 0;background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:var(--shadow);overflow:hidden}
+    td{display:block;width:100%;padding:.55rem .8rem;border-bottom:1px solid var(--border)}
     td:last-child{border-bottom:0}
-    td::before{content:attr(data-label);display:block;margin-bottom:.22rem;color:#667085;font-size:11px;font-weight:750;letter-spacing:.02em;text-transform:uppercase}
+    td::before{content:attr(data-label);display:block;margin-bottom:.18rem;color:var(--muted);font-size:11px;font-weight:650;letter-spacing:.04em;text-transform:uppercase}
     td[colspan]::before{display:none}
-    td[colspan]{background:#fafafa}
-    .subscriber{min-width:0}
-    .button{min-height:42px}
-    .bubble{max-width:100%;border-radius:14px}
-    .avatar{width:34px;height:34px}
+    td[colspan]{background:var(--surface-2)}
+    .button{height:36px;font-size:13px}
   }
 </style>
 </head><body>
-<nav>
-  <a href="/admin?format=html${tokenQ}">Admin</a>
-  <a href="/bots?format=html${tokenQ}">Bots</a>
-  <a href="/conversations?format=html${tokenQ}">Conversations</a>
-  <a href="/pending?format=html${tokenQ}">Pending</a>
-  <a href="/history-imports?format=html${tokenQ}">History Imports</a>
-  <a href="/failed?format=html${tokenQ}">Failed</a>
-  <a href="/messages?format=html${tokenQ}">Messages</a>
-  <a href="/triggers?format=html${tokenQ}">Triggers</a>
-  <a href="/delivery-check?format=html${tokenQ}">Delivery Check</a>
-  <a href="/live-chat-sync?format=html${tokenQ}">Live Chat Sync</a>
-  <a href="/prompt-lab?format=html${tokenQ}">Prompt Lab</a>
-</nav>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="nav">
+      ${primaryNav}
+      <span class="nav-divider" aria-hidden="true"></span>
+      ${secondaryNav}
+    </div>
+  </div>
+</header>
+<main class="layout">
 <h1>${escHtml(title)}</h1>
 ${bodyHtml}
+</main>
 <script>
   document.querySelectorAll('table').forEach((table) => {
     const labels = Array.from(table.querySelectorAll('thead th')).map((th) => th.textContent.trim());
@@ -1487,6 +1629,32 @@ promptLab = createPromptLab({
   withTimeAwareMessages
 });
 
+createChatAnalyzer({
+  app,
+  getBot,
+  listBotIds,
+  redisClient,
+  isRedisEnabled: () => redisEnabled,
+  REDIS_KEY_PREFIX,
+  assertViewMessagesAuth,
+  wantsHtmlResponse,
+  adminPageShell,
+  escHtml,
+  renderSubscriberCell,
+  tokenQuerySuffix,
+  tokenQueryFirst,
+  VIEW_MESSAGES_TOKEN,
+  loadConversation,
+  listConversationIds,
+  loadSubscriberMeta,
+  listPitchClickEvents,
+  callGrokWithPrompt: promptLab.callGrokWithPrompt,
+  createDraftFromAnalyzer: promptLab.createDraftFromAnalyzer,
+  getEffectivePromptBody,
+  PUBLIC_BASE_URL,
+  GROK_API_KEY
+});
+
 // ── Webhook handler factory (per-bot route → shared logic) ───────────────────
 function makeWebhookHandler(botId) {
   return async (req, res) => {
@@ -1669,6 +1837,36 @@ for (const botId of listBotIds()) {
   app.get(`/webhook/uchat/${botId}`, (_req, res) => res.type('html').send(webhookGetInfoHtml));
   app.get(`/webhook/${botId}`, (_req, res) => res.type('html').send(webhookGetInfoHtml));
 }
+
+// ── Pitch click tracking (302 redirect — no VIEW_MESSAGES_TOKEN gate) ───────
+app.get('/r/:botId/:subscriberId/:pitchId', async (req, res) => {
+  const botId = String(req.params.botId || '').toLowerCase();
+  const subscriberId = String(req.params.subscriberId || '').trim();
+  const pitchId = String(req.params.pitchId || '').trim();
+  const bot = getBot(botId);
+  if (!bot || !subscriberId || !pitchId) {
+    return res.status(400).type('text').send('Bad request');
+  }
+  const dest = bot.exclusiveLink;
+  if (!dest) {
+    return res.status(503).type('text').send('Exclusive link not configured for this bot');
+  }
+  const forwarded = String(req.headers['x-forwarded-for'] || '')
+    .split(',')[0]
+    .trim();
+  const remote = req.socket?.remoteAddress || '';
+  try {
+    await logPitchClickEvent(bot.id, subscriberId, {
+      pitchId,
+      ts: new Date().toISOString(),
+      ip: forwarded || remote,
+      ua: String(req.headers['user-agent'] || '').slice(0, 500)
+    });
+  } catch (err) {
+    console.error('❌ pitch click log:', err.message);
+  }
+  res.redirect(302, dest);
+});
 
 // ── GET / — health check ─────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
@@ -2258,29 +2456,111 @@ app.get('/admin', async (req, res) => {
         triggers: `/triggers${tokenFirst}`,
         delivery_check: `/delivery-check${tokenFirst}`,
         live_chat_sync: `/live-chat-sync${tokenFirst}`,
-        prompt_lab: `/prompt-lab${tokenFirst}`
+        prompt_lab: `/prompt-lab${tokenFirst}`,
+        analyzer: `/analyzer${tokenFirst}`
       }
     });
   }
 
+  const publicBaseConfigured = !!String(PUBLIC_BASE_URL || '').trim();
+  const grokConfigured = !!GROK_API_KEY;
+  const tokenConfigured = !!VIEW_MESSAGES_TOKEN;
+  const exclusiveCount = listBotIds().filter((id) => !!getBot(id)?.exclusiveLink).length;
+
+  const stat = (href, label, value, hint, modifier = '') =>
+    `<a class="stat ${modifier}" href="${href}">
+      <div class="label">${escHtml(label)}</div>
+      <div class="value">${escHtml(String(value))}</div>
+      ${hint ? `<div class="hint">${hint}</div>` : ''}
+    </a>`;
+
   const body = `
-    <p class="muted">Read-only dashboard. Use the links above for details.</p>
-    <table>
-      <thead><tr><th>Section</th><th>Count</th><th>Open</th></tr></thead>
-      <tbody>
-        <tr><td>Bots</td><td>${bots.length}</td><td><a href="/bots?format=html${tokenQ}">/bots</a></td></tr>
-        <tr><td>Conversations</td><td>${conversations.length}</td><td><a href="/conversations?format=html${tokenQ}">/conversations</a></td></tr>
-        <tr><td>Pending replies</td><td>${pending.length}</td><td><a href="/pending?format=html${tokenQ}">/pending</a></td></tr>
-        <tr><td>History imports</td><td>${imports.length}</td><td><a href="/history-imports?format=html${tokenQ}">/history-imports</a></td></tr>
-        <tr><td>Failed / discarded (recent)</td><td>${failed.length}</td><td><a href="/failed?format=html${tokenQ}">/failed</a></td></tr>
-        <tr><td>Delivery Check</td><td>review resend</td><td><a href="/delivery-check?format=html${tokenQ}">/delivery-check</a></td></tr>
-        <tr><td>Live Chat Sync</td><td>pull UChat history</td><td><a href="/live-chat-sync?format=html${tokenQ}">/live-chat-sync</a></td></tr>
-        <tr><td>Prompt Lab</td><td>drafts / fixtures</td><td><a href="/prompt-lab?format=html${tokenQ}">/prompt-lab</a></td></tr>
-      </tbody>
-    </table>
-    <p class="muted">Auth: ${VIEW_MESSAGES_TOKEN ? 'token required (?token= or X-View-Token)' : '<span class="bad">no token configured</span>'}</p>
+    <p class="muted">Operational overview. Click any tile to drill in.</p>
+
+    <div class="grid grid-4" style="margin-top:.85rem">
+      ${stat(`/conversations?format=html${tokenQ}`, 'Conversations', conversations.length, 'all bots combined')}
+      ${stat(`/pending?format=html${tokenQ}`, 'Pending replies', pending.length, pending.length ? 'awaiting flush' : 'queue clear', pending.length ? '' : 'ok')}
+      ${stat(`/failed?format=html${tokenQ}`, 'Failed (recent)', failed.length, 'in-memory log', failed.length ? 'danger' : '')}
+      ${stat(`/history-imports?format=html${tokenQ}`, 'History imports', imports.length, 'first-touch UChat pulls')}
+    </div>
+
+    <h2>AI tuning</h2>
+    <div class="grid grid-2">
+      <a class="card stat" href="/prompt-lab?format=html${tokenQ}" style="display:block">
+        <div class="label">Prompt Lab</div>
+        <div class="value" style="font-size:1.15rem">Drafts &amp; A/B tests</div>
+        <div class="hint">Clone the live prompt, edit safely, A/B against real conversations, then promote.</div>
+      </a>
+      <a class="card stat" href="/analyzer?format=html${tokenQ}" style="display:block">
+        <div class="label">Chat &amp; Pitch Analyzer</div>
+        <div class="value" style="font-size:1.15rem">Scores &amp; insights</div>
+        <div class="hint">LLM judge + click tracking; one-click "Suggest prompt patch" feeds into Prompt Lab.</div>
+      </a>
+    </div>
+
+    <h2>Bots</h2>
+    <div class="grid grid-3">
+      ${bots.map((b) => `
+        <div class="card">
+          <div class="label muted" style="font-size:11.5px;letter-spacing:.04em;text-transform:uppercase">${escHtml(b.id)}</div>
+          <div style="font-size:1.05rem;font-weight:650;margin-top:.1rem">${escHtml(b.display_name)}</div>
+          <div class="muted" style="margin-top:.35rem">tz <code>${escHtml(b.timezone)}</code></div>
+          <div class="muted" style="margin-top:.15rem">UChat key ${b.uchat_key === 'present' ? '<span class="ok">present</span>' : '<span class="bad">missing</span>'}</div>
+          <div class="muted" style="margin-top:.15rem">conversations ${escHtml(String(b.conversation_count))} · pending ${escHtml(String(b.pending_count))}</div>
+          <div class="actions" style="margin-top:.65rem">
+            <a class="button" href="/conversations?format=html&bot=${encodeURIComponent(b.id)}${tokenQ}">Threads</a>
+            <a class="button" href="/analyzer/conversations?format=html&bot=${encodeURIComponent(b.id)}${tokenQ}">Analyze</a>
+          </div>
+        </div>`).join('')}
+    </div>
+
+    <h2>System</h2>
+    <div class="card">
+      <div class="grid grid-3">
+        <div>
+          <div class="label muted" style="font-size:11.5px;letter-spacing:.04em;text-transform:uppercase">Storage</div>
+          <div style="font-weight:650;margin-top:.15rem">${redisEnabled ? '<span class="ok">Redis connected</span>' : '<span class="warn">In-memory only</span>'}</div>
+          <div class="muted">${redisEnabled ? 'persistent across restarts' : 'restart wipes state'}</div>
+        </div>
+        <div>
+          <div class="label muted" style="font-size:11.5px;letter-spacing:.04em;text-transform:uppercase">Grok</div>
+          <div style="font-weight:650;margin-top:.15rem">${grokConfigured ? '<span class="ok">API key set</span>' : '<span class="bad">missing</span>'}</div>
+          <div class="muted">model ${escHtml(GROK_MODEL)}</div>
+        </div>
+        <div>
+          <div class="label muted" style="font-size:11.5px;letter-spacing:.04em;text-transform:uppercase">Admin auth</div>
+          <div style="font-weight:650;margin-top:.15rem">${tokenConfigured ? '<span class="ok">token required</span>' : '<span class="warn">unprotected</span>'}</div>
+          <div class="muted">${tokenConfigured ? '?token= or X-View-Token' : 'set VIEW_MESSAGES_TOKEN before exposing'}</div>
+        </div>
+        <div>
+          <div class="label muted" style="font-size:11.5px;letter-spacing:.04em;text-transform:uppercase">Pitch tracking</div>
+          <div style="font-weight:650;margin-top:.15rem">${publicBaseConfigured ? '<span class="ok">PUBLIC_BASE_URL set</span>' : '<span class="warn">not set</span>'}</div>
+          <div class="muted">${publicBaseConfigured ? escHtml(PUBLIC_BASE_URL) : 'add to .env so /r/… click links work'}</div>
+        </div>
+        <div>
+          <div class="label muted" style="font-size:11.5px;letter-spacing:.04em;text-transform:uppercase">Exclusive links</div>
+          <div style="font-weight:650;margin-top:.15rem">${exclusiveCount}/${listBotIds().length} bots configured</div>
+          <div class="muted">SARA_EXCLUSIVE_LINK / ESMA_EXCLUSIVE_LINK</div>
+        </div>
+        <div>
+          <div class="label muted" style="font-size:11.5px;letter-spacing:.04em;text-transform:uppercase">Debounce window</div>
+          <div style="font-weight:650;margin-top:.15rem">${formatDelay(DEBOUNCE_MIN_MS)} – ${formatDelay(DEBOUNCE_MAX_MS)}</div>
+          <div class="muted">silence required before a Grok flush</div>
+        </div>
+      </div>
+    </div>
+
+    <h2>Debug shortcuts</h2>
+    <div class="actions">
+      <a class="button" href="/messages?format=html${tokenQ}">Threads</a>
+      <a class="button" href="/triggers?format=html${tokenQ}">Triggers</a>
+      <a class="button" href="/delivery-check?format=html${tokenQ}">Delivery check</a>
+      <a class="button" href="/live-chat-sync?format=html${tokenQ}">Live chat sync</a>
+      <a class="button" href="/history-imports?format=html${tokenQ}">History imports</a>
+      <a class="button" href="/failed?format=html${tokenQ}">Failed events</a>
+    </div>
   `;
-  res.type('html').send(adminPageShell('Admin / Debug', body));
+  res.type('html').send(adminPageShell('Admin', body));
 });
 
 app.get('/bots', async (req, res) => {
@@ -2306,7 +2586,22 @@ app.get('/bots', async (req, res) => {
     })
     .join('');
 
+  const saraOn = isSaraEnabled();
+  const saraStatus = saraOn
+    ? '<span class="ok">enabled</span>'
+    : '<span class="bad">disabled (banned)</span>';
+  const saraAction = `
+    <form method="post" action="/bots/sara/toggle?format=html${tokenQ}" style="display:inline">
+      <input type="hidden" name="enabled" value="${saraOn ? 'false' : 'true'}">
+      <button class="button" type="submit">${saraOn ? 'Disable Sara' : 'Enable Sara'}</button>
+    </form>
+  `;
+
   const body = `
+    <div class="card" style="margin-bottom:1rem">
+      <strong>Sara status:</strong> ${saraStatus} &nbsp; ${saraAction}
+      <span class="muted" style="margin-left:.5rem">Toggle only affects runtime. Restart needed for webhook routes if enabling.</span>
+    </div>
     <table>
       <thead><tr>
         <th>ID</th><th>Display</th><th>Timezone</th><th>UChat key</th><th>Route</th>
@@ -2316,6 +2611,17 @@ app.get('/bots', async (req, res) => {
     </table>
   `;
   res.type('html').send(adminPageShell('Bots', body));
+});
+
+// Toggle Sara (ban/unban) — dashboard only
+app.post('/bots/sara/toggle', async (req, res) => {
+  if (!assertViewMessagesAuth(req, res)) return;
+  const enabled = String(req.body.enabled || '').toLowerCase() === 'true';
+  setSaraEnabled(enabled);
+  if (wantsHtmlResponse(req)) {
+    return res.redirect(`/bots?format=html${tokenQuerySuffix()}`);
+  }
+  res.json({ sara_enabled: isSaraEnabled() });
 });
 
 app.get('/conversations', async (req, res) => {
@@ -2582,6 +2888,10 @@ app.listen(PORT, () => {
     console.log(
       `   GET  /prompt-lab?format=html ← Prompt drafts + A/B tests${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
     );
+    console.log(
+      `   GET  /analyzer?format=html   ← Chat & pitch scores + insights${VIEW_MESSAGES_TOKEN ? ' (token required)' : ''}`
+    );
+    console.log('   GET  /r/:bot/:subscriber/:pitchId ← Pitch click tracking → exclusive link (no token)');
     console.log(`   Tip: npm run dev:public      → Public HTTPS URL (TUNNEL=serveo|pinggy|cloudflare)\n`);
   });
 }

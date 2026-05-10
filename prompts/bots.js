@@ -11,24 +11,33 @@
 const { ESMA_PROMPT } = require('./esma');
 const { SARA_PROMPT } = require('./sara');
 
-const BOTS = {
-  esma: {
-    id: 'esma',
-    displayName: 'Esma',
-    prompt: ESMA_PROMPT,
-    timezone: process.env.ESMA_TIMEZONE || 'Europe/London',
-    uchatApiKey: process.env.UCHAT_ESMA_API_KEY
-  },
-  sara: {
-    id: 'sara',
-    displayName: 'Sara',
-    prompt: SARA_PROMPT,
-    timezone: process.env.SARA_TIMEZONE || 'America/New_York',
-    uchatApiKey: process.env.UCHAT_SARA_API_KEY
-  }
-};
+let saraEnabled = String(process.env.SARA_ENABLED || '').toLowerCase() === 'true';
 
-const DEFAULT_BOT_ID = 'esma';
+function buildBots() {
+  const bots = {
+    esma: {
+      id: 'esma',
+      displayName: 'Esma',
+      prompt: ESMA_PROMPT,
+      timezone: process.env.ESMA_TIMEZONE || 'Europe/London',
+      uchatApiKey: process.env.UCHAT_ESMA_API_KEY,
+      exclusiveLink: String(process.env.ESMA_EXCLUSIVE_LINK || '').trim() || null
+    }
+  };
+  if (saraEnabled) {
+    bots.sara = {
+      id: 'sara',
+      displayName: 'Sara',
+      prompt: SARA_PROMPT,
+      timezone: process.env.SARA_TIMEZONE || 'America/New_York',
+      uchatApiKey: process.env.UCHAT_SARA_API_KEY,
+      exclusiveLink: String(process.env.SARA_EXCLUSIVE_LINK || '').trim() || null
+    };
+  }
+  return bots;
+}
+
+let BOTS = buildBots();
 
 function getBot(botId) {
   if (!botId) return BOTS[DEFAULT_BOT_ID];
@@ -45,4 +54,23 @@ function getEffectivePrompt(botId, promptOverride) {
   return promptOverride || bot.prompt;
 }
 
-module.exports = { BOTS, DEFAULT_BOT_ID, getBot, listBotIds, getEffectivePrompt };
+function isSaraEnabled() {
+  return saraEnabled;
+}
+
+function setSaraEnabled(enabled) {
+  saraEnabled = !!enabled;
+  BOTS = buildBots();
+}
+
+const DEFAULT_BOT_ID = 'esma';
+
+module.exports = {
+  BOTS,
+  DEFAULT_BOT_ID,
+  getBot,
+  listBotIds,
+  getEffectivePrompt,
+  isSaraEnabled,
+  setSaraEnabled
+};
