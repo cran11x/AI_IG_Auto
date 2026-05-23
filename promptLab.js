@@ -730,6 +730,8 @@ function createPromptLab(deps) {
         </div>
         <div class="actions" style="margin-top:.75rem">
           <button class="button" type="submit">Preview export</button>
+          <button class="button" type="submit" formaction="/prompt-lab/export${tokenQ}" formmethod="get" name="downloadFormat" value="jsonl">Download JSONL</button>
+          <button class="button" type="submit" formaction="/prompt-lab/export${tokenQ}" formmethod="get" name="downloadFormat" value="json">Download JSON</button>
           <a class="button" href="/prompt-lab/export?bot=esma&format=jsonl&limit=50&minMessages=2${tokenQ}">Quick: Esma JSONL</a>
           ${listBotIds().includes('sara') ? `<a class="button" href="/prompt-lab/export?bot=sara&format=jsonl&limit=50&minMessages=2${tokenQ}">Quick: Sara JSONL</a>` : ''}
         </div>
@@ -885,18 +887,22 @@ function createPromptLab(deps) {
   app.get('/prompt-lab/export', async (req, res) => {
     if (!assertViewMessagesAuth(req, res)) return;
     try {
-      const downloadFormat = toCleanString(req.query.downloadFormat || req.query.format || 'jsonl');
-      const query = { ...req.query, format: downloadFormat === 'json' ? 'json' : 'jsonl' };
+      const rawFormat = toCleanString(req.query.downloadFormat || req.query.format || 'jsonl').toLowerCase();
+      const isHtmlPreview = rawFormat === 'html';
+      const downloadFormat = rawFormat === 'json' ? 'json' : 'jsonl';
+      const query = { ...req.query, format: downloadFormat };
       const result = await exportConversations(exportDeps(), query);
       const botSlug = result.filters.botId || 'all';
       const ext = result.format === 'json' ? 'json' : 'jsonl';
       const filename = `conversations-${botSlug}-${new Date().toISOString().slice(0, 10)}.${ext}`;
       const tokenQ = tokenQuerySuffix();
 
-      if (!wantsHtmlResponse(req) && downloadFormat !== 'html') {
+      if (!isHtmlPreview) {
+        const body = formatExportBody(result);
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.setHeader('Cache-Control', 'no-store');
         res.type(result.format === 'json' ? 'application/json' : 'application/x-ndjson');
-        return res.send(formatExportBody(result));
+        return res.send(body);
       }
 
       const downloadParams = new URLSearchParams();

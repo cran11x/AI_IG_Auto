@@ -192,7 +192,10 @@ function formatExportBody(result) {
   if (result.format === 'json') {
     return JSON.stringify({ count: result.count, filters: result.filters, conversations: result.conversations }, null, 2);
   }
-  return result.conversations.map((row) => JSON.stringify(row)).join('\n') + (result.conversations.length ? '\n' : '');
+  if (!result.conversations.length) {
+    return '{"note":"no conversations matched filters"}\n';
+  }
+  return `${result.conversations.map((row) => JSON.stringify(row)).join('\n')}\n`;
 }
 
 module.exports = {
