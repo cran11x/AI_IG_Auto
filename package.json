@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node index.js",
     "dev:public": "node dev-public.js",
-    "test:prompt": "node prompt-tester.js"
+    "test:prompt": "node prompt-tester.js",
+    "export:conversations": "node export-conversations.js"
   },
   "dependencies": {
     "axios": "^1.7.0",

@@ -1,3 +1,5 @@
+const { exportConversations, formatExportBody } = require('./conversationExport');
+
 function createPromptLab(deps) {
   const {
     app,
@@ -22,6 +24,7 @@ function createPromptLab(deps) {
     loadConversation,
     listConversationIds,
     loadSubscriberMeta,
+    listPitchClickEvents,
     withTimeAwareMessages
   } = deps;
 
@@ -306,6 +309,19 @@ function createPromptLab(deps) {
     return res.data.choices[0].message.content;
   }
 
+  function sourceWithEditedBody(source, body, label) {
+    const editedBody = toCleanString(body);
+    if (!editedBody) return source;
+    if (editedBody === toCleanString(source.body)) return source;
+    return {
+      ...source,
+      type: source.type === 'custom' ? source.type : 'custom',
+      id: `${source.type}:${source.id}`,
+      name: `${label} edited from ${source.name}`,
+      body: editedBody
+    };
+  }
+
   async function runLastOnly(source, messages, botId) {
     const context = lastUserContext(messages);
     if (!context.length) throw new Error('Selected conversation has no user message to test.');
@@ -390,6 +406,17 @@ function createPromptLab(deps) {
     return fixture;
   }
 
+  function exportDeps() {
+    return {
+      listBotIds,
+      getBot,
+      listConversationIds,
+      loadConversation,
+      loadSubscriberMeta,
+      listPitchClickEvents
+    };
+  }
+
   async function collectLiveConversationOptions() {
     const rows = [];
     for (const botId of listBotIds()) {
@@ -420,7 +447,7 @@ function createPromptLab(deps) {
     return fallbackId;
   }
 
-  function renderPromptSelect(name, sources, selected) {
+  function renderPromptSelect(name, sources, selected, attrs = '') {
     const options = sources
       .map((source) => {
         const value = promptSourceValue(source);
@@ -428,7 +455,23 @@ function createPromptLab(deps) {
         return `<option value="${escHtml(value)}"${sel}>${escHtml(formatPromptLabel(source))}</option>`;
       })
       .join('');
-    return `<select name="${escHtml(name)}" required>${options}</select>`;
+    return `<select name="${escHtml(name)}" ${attrs} required>${options}</select>`;
+  }
+
+  function findPromptSource(sources, value) {
+    const wanted = String(value || '');
+    return sources.find((source) => promptSourceValue(source) === wanted) || sources[0] || null;
+  }
+
+  function promptSourceBodiesJson(sources) {
+    const map = {};
+    for (const source of sources) {
+      map[promptSourceValue(source)] = {
+        label: formatPromptLabel(source),
+        body: source.body || ''
+      };
+    }
+    return JSON.stringify(map).replace(/</g, '\\u003c');
   }
 
   function renderConversationHiddenInputs(conversation) {
@@ -656,6 +699,42 @@ function createPromptLab(deps) {
         </div>
       </div>
 
+      <h2 id="export-conversations">Export conversations</h2>
+      <p class="muted">Download filtered production threads as JSON or JSONL to review bad replies and share with prompt tuning.</p>
+      <form class="card" method="get" action="/prompt-lab/export">
+        <input type="hidden" name="format" value="html">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:.75rem">
+          <p><label>Bot<br>
+            <select name="bot">
+              <option value="">All bots</option>
+              ${listBotIds().map((id) => `<option value="${escHtml(id)}">${escHtml(BOTS[id]?.displayName || id)}</option>`).join('')}
+            </select>
+          </label></p>
+          <p><label>Min messages<br><input name="minMessages" type="number" min="0" value="2" style="width:100%"></label></p>
+          <p><label>Limit<br><input name="limit" type="number" min="1" max="500" value="50" style="width:100%"></label></p>
+          <p><label>Link sent<br>
+            <select name="linkSent" style="width:100%">
+              <option value="">Any</option>
+              <option value="true">Yes (pitched)</option>
+              <option value="false">No (not pitched)</option>
+            </select>
+          </label></p>
+          <p><label>Since (ISO date)<br><input name="since" type="date" style="width:100%"></label></p>
+          <p><label>Until (ISO date)<br><input name="until" type="date" style="width:100%"></label></p>
+          <p><label>File format<br>
+            <select name="downloadFormat" style="width:100%">
+              <option value="jsonl">JSONL (one thread per line)</option>
+              <option value="json">JSON array</option>
+            </select>
+          </label></p>
+        </div>
+        <div class="actions" style="margin-top:.75rem">
+          <button class="button" type="submit">Preview export</button>
+          <a class="button" href="/prompt-lab/export?bot=esma&format=jsonl&limit=50&minMessages=2${tokenQ}">Quick: Esma JSONL</a>
+          ${listBotIds().includes('sara') ? `<a class="button" href="/prompt-lab/export?bot=sara&format=jsonl&limit=50&minMessages=2${tokenQ}">Quick: Sara JSONL</a>` : ''}
+        </div>
+      </form>
+
       <h2 id="recent-conversations">Recent conversations</h2>
       <table><thead><tr><th>Bot</th><th>Person</th><th>Msgs</th><th>Last message</th><th>Actions</th></tr></thead><tbody>${liveRows || '<tr><td colspan="5" class="muted">No live conversations found yet.</td></tr>'}</tbody></table>
 
@@ -697,6 +776,8 @@ function createPromptLab(deps) {
     const matchingDraft = drafts.find((draft) => !draft.botId || draft.botId === conversation.botId);
     const selectedA = toCleanString(req.query.promptA) || `bot:${conversation.botId}`;
     const selectedB = toCleanString(req.query.promptB) || (matchingDraft ? `draft:${matchingDraft.id}` : `bot:${conversation.botId}`);
+    const sourceA = findPromptSource(sources, selectedA);
+    const sourceB = findPromptSource(sources, selectedB);
     const tokenQ = tokenQuerySuffix();
     const msgCount = nonSystemMessages(conversation.messages).length;
     const returnTo = testUrlForConversation(conversation, '', false);
@@ -737,12 +818,21 @@ function createPromptLab(deps) {
         </div>
         <div class="card">
           <h2>Compare prompts</h2>
+          <p class="muted">Pick prompts, edit the text below, then regenerate. This does not change production unless you save/promote a draft.</p>
           <form method="post" action="${postAction('/prompt-lab/ab-test')}">
             ${renderConversationHiddenInputs(conversation)}
-            <p><label>Prompt A<br>${renderPromptSelect('promptA', sources, selectedA)}</label></p>
-            <p><label>Prompt B<br>${renderPromptSelect('promptB', sources, selectedB)}</label></p>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:.75rem">
+              <div>
+                <p><label><strong>Prompt A</strong><br>${renderPromptSelect('promptA', sources, selectedA, 'data-prompt-select="A" style="width:100%"')}</label></p>
+                <textarea name="promptABody" data-prompt-body="A" rows="18" style="width:100%;font-family:ui-monospace,SFMono-Regular,Consolas,monospace" required>${escHtml(sourceA?.body || '')}</textarea>
+              </div>
+              <div>
+                <p><label><strong>Prompt B</strong><br>${renderPromptSelect('promptB', sources, selectedB, 'data-prompt-select="B" style="width:100%"')}</label></p>
+                <textarea name="promptBBody" data-prompt-body="B" rows="18" style="width:100%;font-family:ui-monospace,SFMono-Regular,Consolas,monospace" required>${escHtml(sourceB?.body || '')}</textarea>
+              </div>
+            </div>
             <p><label>Test type<br><select name="mode"><option value="last">Next reply only</option><option value="replay">Replay full conversation</option></select></label></p>
-            <button class="button" type="submit">Compare side by side</button>
+            <button class="button" type="submit">Regenerate answers side by side</button>
           </form>
           <hr>
           <form method="post" action="${postAction('/prompt-lab/drafts/clone')}">
@@ -753,6 +843,21 @@ function createPromptLab(deps) {
           </form>
         </div>
       </div>
+      <script type="application/json" id="prompt-source-bodies">${promptSourceBodiesJson(sources)}</script>
+      <script>
+        (() => {
+          const raw = document.getElementById('prompt-source-bodies')?.textContent || '{}';
+          const sources = JSON.parse(raw);
+          document.querySelectorAll('[data-prompt-select]').forEach((select) => {
+            select.addEventListener('change', () => {
+              const side = select.getAttribute('data-prompt-select');
+              const textarea = document.querySelector(\`[data-prompt-body="\${side}"]\`);
+              if (!textarea || !sources[select.value]) return;
+              textarea.value = sources[select.value].body || '';
+            });
+          });
+        })();
+      </script>
     `;
     return res.type('html').send(adminPageShell(htmlPageTitle('Test Conversation'), body));
   }
@@ -773,6 +878,81 @@ function createPromptLab(deps) {
       await renderPromptLabTest(req, res);
     } catch (err) {
       console.error('❌ /prompt-lab/test error:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/prompt-lab/export', async (req, res) => {
+    if (!assertViewMessagesAuth(req, res)) return;
+    try {
+      const downloadFormat = toCleanString(req.query.downloadFormat || req.query.format || 'jsonl');
+      const query = { ...req.query, format: downloadFormat === 'json' ? 'json' : 'jsonl' };
+      const result = await exportConversations(exportDeps(), query);
+      const botSlug = result.filters.botId || 'all';
+      const ext = result.format === 'json' ? 'json' : 'jsonl';
+      const filename = `conversations-${botSlug}-${new Date().toISOString().slice(0, 10)}.${ext}`;
+      const tokenQ = tokenQuerySuffix();
+
+      if (!wantsHtmlResponse(req) && downloadFormat !== 'html') {
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.type(result.format === 'json' ? 'application/json' : 'application/x-ndjson');
+        return res.send(formatExportBody(result));
+      }
+
+      const downloadParams = new URLSearchParams();
+      if (result.filters.botId) downloadParams.set('bot', result.filters.botId);
+      if (result.filters.minMessages) downloadParams.set('minMessages', String(result.filters.minMessages));
+      if (result.filters.limit) downloadParams.set('limit', String(result.filters.limit));
+      if (result.filters.linkSent === true) downloadParams.set('linkSent', 'true');
+      if (result.filters.linkSent === false) downloadParams.set('linkSent', 'false');
+      if (result.filters.since) downloadParams.set('since', result.filters.since);
+      if (result.filters.until) downloadParams.set('until', result.filters.until);
+      downloadParams.set('format', result.format);
+      const downloadJsonl = `/prompt-lab/export?${downloadParams.toString()}${tokenQ}`;
+      downloadParams.set('format', 'json');
+      const downloadJson = `/prompt-lab/export?${downloadParams.toString()}${tokenQ}`;
+
+      const previewRows = result.conversations
+        .slice(0, 20)
+        .map(
+          (row) => `<tr>
+            <td><span class="pill">${escHtml(row.botId)}</span></td>
+            <td>${renderSubscriberCell(row.meta, row.subscriberId)}</td>
+            <td>${row.messageCount}</td>
+            <td>${row.linkSent ? '<span class="ok">yes</span>' : '<span class="muted">no</span>'}</td>
+            <td>${escHtml(row.startedAt || '')}</td>
+            <td>${escHtml(row.endedAt || '')}</td>
+            <td><a href="/messages/${encodeURIComponent(row.botId)}/${encodeURIComponent(row.subscriberId)}?format=html${tokenQ}">open</a></td>
+          </tr>`
+        )
+        .join('');
+
+      const body = `
+        <div class="actions">
+          <a class="button" href="/prompt-lab?format=html${tokenQ}">Prompt Lab</a>
+          <a class="button" href="${downloadJsonl}">Download JSONL (${result.count})</a>
+          <a class="button" href="${downloadJson}">Download JSON (${result.count})</a>
+        </div>
+        <p class="muted">Filters: bot=${escHtml(result.filters.botId || 'all')}, minMessages=${result.filters.minMessages}, limit=${result.filters.limit}, linkSent=${result.filters.linkSent == null ? 'any' : result.filters.linkSent}</p>
+        <table><thead><tr><th>Bot</th><th>User</th><th>Msgs</th><th>Link</th><th>Started</th><th>Ended</th><th></th></tr></thead>
+        <tbody>${previewRows || '<tr><td colspan="7" class="muted">No conversations match these filters.</td></tr>'}</tbody></table>
+        ${result.count > 20 ? `<p class="muted">Showing first 20 of ${result.count}. Use download links for full export.</p>` : ''}
+        <details class="card"><summary>Export form</summary>
+          <form method="get" action="/prompt-lab/export">
+            <input type="hidden" name="format" value="html">
+            <p><label>Bot <select name="bot"><option value="">All</option>${listBotIds().map((id) => `<option value="${escHtml(id)}"${result.filters.botId === id ? ' selected' : ''}>${escHtml(id)}</option>`).join('')}</select></label></p>
+            <p><label>Min messages <input name="minMessages" type="number" value="${result.filters.minMessages}"></label></p>
+            <p><label>Limit <input name="limit" type="number" value="${result.filters.limit}"></label></p>
+            <p><label>Link sent <select name="linkSent"><option value="">Any</option><option value="true"${result.filters.linkSent === true ? ' selected' : ''}>Yes</option><option value="false"${result.filters.linkSent === false ? ' selected' : ''}>No</option></select></label></p>
+            <p><label>Since <input name="since" type="date" value="${escHtml((result.filters.since || '').slice(0, 10))}"></label></p>
+            <p><label>Until <input name="until" type="date" value="${escHtml((result.filters.until || '').slice(0, 10))}"></label></p>
+            <button class="button" type="submit">Apply filters</button>
+          </form>
+        </details>
+      `;
+      return res.type('html').send(adminPageShell(htmlPageTitle('Export'), body));
+    } catch (err) {
+      console.error('❌ /prompt-lab/export error:', err.message);
       res.status(500).json({ error: err.message });
     }
   });
@@ -973,12 +1153,14 @@ function createPromptLab(deps) {
         req.body.botId = botId;
         req.body.subscriberId = subscriberParts.join(':');
       }
-      const [sourceA, sourceB, conversation] = await Promise.all([
+      const [baseSourceA, baseSourceB, conversation] = await Promise.all([
         resolvePromptSource(req.body.promptA),
         resolvePromptSource(req.body.promptB),
         loadConversationSource(req)
       ]);
-      if (!sourceA || !sourceB) return res.status(400).json({ error: 'Select two valid prompts.' });
+      if (!baseSourceA || !baseSourceB) return res.status(400).json({ error: 'Select two valid prompts.' });
+      const sourceA = sourceWithEditedBody(baseSourceA, req.body.promptABody, 'Prompt A');
+      const sourceB = sourceWithEditedBody(baseSourceB, req.body.promptBBody, 'Prompt B');
       const mode = req.body.mode === 'replay' ? 'replay' : 'last';
       const runner = mode === 'replay' ? runReplay : runLastOnly;
       const [resultA, resultB] = await Promise.all([
@@ -1073,12 +1255,32 @@ function createPromptLab(deps) {
     res.json({ status: 'ok', bot: bot.id, active: null });
   });
 
+  async function createDraftFromAnalyzer({ name, botId, body }) {
+    const cleanBody = toCleanString(body);
+    if (!cleanBody) throw new Error('Prompt body is required');
+    const id = makeId('draft');
+    const draft = {
+      id,
+      name: toCleanString(name) || 'Analyzer suggestion',
+      botId: toCleanString(botId) || 'esma',
+      body: cleanBody,
+      baseVariant: 'analyzer',
+      createdAt: nowIso(),
+      updatedAt: nowIso()
+    };
+    await saveDraft(draft);
+    return draft;
+  }
+
   return {
     getActivePrompt,
     getEffectivePrompt,
     listFixtures,
     listDrafts,
-    loadDraft
+    loadDraft,
+    callGrokWithPrompt,
+    createDraftFromAnalyzer,
+    exportConversations: (filters) => exportConversations(exportDeps(), filters)
   };
 }
 

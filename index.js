@@ -1626,6 +1626,7 @@ promptLab = createPromptLab({
   loadConversation,
   listConversationIds,
   loadSubscriberMeta,
+  listPitchClickEvents,
   withTimeAwareMessages
 });
 
